@@ -1,0 +1,15 @@
+# Custom partition table for the 16MB flash on this board (W25Q128 per the
+# schematic -- double the CrowPanel build's 8MB). Same rationale as that
+# build's partitions.csv: give the app a comfortable but not wasteful slice
+# and hand the rest to LittleFS for book storage.
+#
+# otadata/ota_0 are kept even though this firmware never does an OTA update:
+# the Arduino ESP32 bootloader always expects an otadata slot and uses
+# boot_app0.bin (flashed automatically) to point it at ota_0 on first boot.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x200000,
+spiffs,     data, spiffs,   0x210000, 0xDE0000,
+coredump,   data, coredump, 0xFF0000, 0x10000,
