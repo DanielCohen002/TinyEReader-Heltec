@@ -41,8 +41,10 @@
   Everywhere else (Home / Choose Book / Wi-Fi / delete dialog):
     Left tap    -> move selection      Right tap    -> move selection
     Left hold   -> open delete dialog (Choose Book only, on a highlighted book)
-    Right hold  -> select / confirm
-    Both held   -> Home menu (also cancels the delete dialog without deleting)
+    Both held   -> select / confirm (a deliberate two-button press, so it
+                   doesn't fire by accident the way a single-button hold can)
+    Right hold  -> go Home / cancel (also cancels the delete dialog without
+                   deleting; a no-op on the Home screen itself)
 
   Refresh strategy: the first render after waking/booting is a full
   black-flash refresh (clears ghosting left over from before sleep); every
@@ -63,18 +65,20 @@
 #include "HT_lCMEN2R13EFC1.h"
 #include "HT_E0213A367.h"
 
-// 1-bit icon bitmaps for the Home screen, packed LSB-first for
-// ScreenDisplay::drawXbm() -- generated with tools/image_to_epd.py
-// --format xbm from hand-drawn Piskel files.
+// 1-bit bitmaps (Home screen icons, Wi-Fi screen QR codes) packed
+// LSB-first for ScreenDisplay::drawXbm() -- generated with
+// tools/image_to_epd.py --format xbm from hand-drawn Piskel files /
+// QR PNGs.
 #include "generated/icon_book.h"
 #include "generated/icon_bookshelf.h"
 #include "generated/icon_wifi.h"
+#include "generated/qr_wifi.h"
+#include "generated/qr_webpage.h"
 
 // ---------------- HARDWARE CONFIG ----------------
-// E-paper SPI pins, Vext (peripheral power) pins, and the battery ADC pin
-// are all taken directly from Heltec's own factory-test sketch and example
-// code for this exact board (see hardware-research/heltec-e213), not
-// guessed.
+// E-paper SPI pins and Vext (peripheral power) pins are all taken directly
+// from Heltec's own factory-test sketch and example code for this exact
+// board (see hardware-research/heltec-e213), not guessed.
 #define PIN_EINK_RST   3
 #define PIN_EINK_DC    2
 #define PIN_EINK_CS    5
@@ -109,17 +113,17 @@ constexpr uint8_t CHOOSE_VISIBLE_ROWS = 8;  // one row is a free-space header, s
 
 constexpr unsigned long HOLD_THRESHOLD_MS = 500;  // tap vs. hold cutoff for both buttons
 
-// Reading screen layout. ArialMT_Plain_10's line height is inferred from
-// spacing used in Heltec's own demo code (not a documented constant) --
-// verify once real hardware is available and adjust if lines overlap or
-// leave too much gap.
+// Reading screen layout. Uses ArialMT_Plain_16 (19px line height, per its
+// own font table header) for 6 lines per page, matching the CrowPanel
+// build's line count -- ArialMT_Plain_10 (13px) was fitting 9 lines, too
+// small/dense for comfortable reading.
 constexpr uint16_t SCREEN_W = 250;
 constexpr uint16_t SCREEN_H = 122;
 constexpr uint16_t BOOK_LEFT_MARGIN = 2;
 constexpr uint16_t BOOK_TOP_MARGIN = 1;
-constexpr uint16_t BOOK_LINE_HEIGHT = 13;
+constexpr uint16_t BOOK_LINE_HEIGHT = 19;
 constexpr uint16_t BOOK_USABLE_WIDTH = SCREEN_W - 2 * BOOK_LEFT_MARGIN;
-constexpr uint8_t BOOK_MAX_LINES = 9;  // (122-1)/13, generous vs. the CrowPanel's 6
+constexpr uint8_t BOOK_MAX_LINES = 6;  // (122-1)/19 = 6.4, rounds down to 6
 
 constexpr uint16_t MENU_LEFT_MARGIN = 2;
 constexpr uint16_t MENU_LINE_HEIGHT = 13;
@@ -1068,7 +1072,7 @@ void renderPageAt(uint32_t offset) {
   }
 
   ensureDisplayAwake();
-  display->setFont(ArialMT_Plain_10);
+  display->setFont(ArialMT_Plain_16);
 
   String lines[BOOK_MAX_LINES];
   uint8_t lineCount = 0;
@@ -1094,7 +1098,7 @@ void nextPage() {
 void previousPage() {
   if (!book || pageStart == 0) return;
   ensureDisplayAwake();
-  display->setFont(ArialMT_Plain_10);  // findPreviousPageStart's replay measures against this
+  display->setFont(ArialMT_Plain_16);  // findPreviousPageStart's replay measures against this
   renderPageAt(findPreviousPageStart(pageStart));
 }
 
@@ -1120,9 +1124,9 @@ void renderHome() {
     }
   }
 
-  // Only Right-hold does anything on this screen (selects the highlighted
-  // item); both-hold is a no-op here since Home is already Home.
-  display->drawString(4, 102, "Tap=Move  Hold Right=Select");
+  // Only Both-held does anything on this screen (selects the highlighted
+  // item); Right-held is a no-op here since Home is already Home.
+  display->drawString(4, 102, "Tap=Move  Both=Select");
 
   display->update(BLACK_BUFFER);
   refreshDisplay();
@@ -1203,16 +1207,17 @@ void renderWifiInfo() {
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
 
-  display->drawString(MENU_LEFT_MARGIN, 2, "Connect to Wi-Fi:");
-  String ssidLine = "SSID: ";
-  ssidLine += AP_NAME;
-  String passLine = "Pass: ";
-  passLine += AP_PASS;
-  display->drawString(MENU_LEFT_MARGIN, 2 + MENU_LINE_HEIGHT, ssidLine);
-  display->drawString(MENU_LEFT_MARGIN, 2 + 2 * MENU_LINE_HEIGHT, passLine);
-  display->drawString(MENU_LEFT_MARGIN, 2 + 3 * MENU_LINE_HEIGHT, "Then open:");
-  display->drawString(MENU_LEFT_MARGIN, 2 + 4 * MENU_LINE_HEIGHT, "192.168.4.1");
-  display->drawString(MENU_LEFT_MARGIN, 2 + 6 * MENU_LINE_HEIGHT, "(hold Right to go back)");
+  constexpr uint16_t leftX = 4;
+  constexpr uint16_t rightX = leftX + QRWIFI_W + 8;
+  constexpr uint16_t qrY = 20;
+
+  display->drawString(leftX, 2, "Wi-Fi");
+  display->drawXbm(leftX, qrY, QRWIFI_W, QRWIFI_H, qrWifi);
+
+  display->drawString(rightX, 2, "Web");
+  display->drawXbm(rightX, qrY, QRWEBPAGE_W, QRWEBPAGE_H, qrWebpage);
+
+  display->drawString(leftX, qrY + QRWIFI_H + 4, "192.168.4.1");
 
   display->update(BLACK_BUFFER);
   refreshDisplay();
@@ -1325,6 +1330,11 @@ void dispatchGesture(ButtonGesture gesture) {
       }
       break;
 
+    // Everywhere outside the reading screen, select/confirm is Both-held
+    // (deliberate two-button press) and Right-held is the universal
+    // go-home/cancel gesture -- previously Right-held did the selecting,
+    // which meant an accidental Right hold (e.g. while just meaning to
+    // page/chapter-skip out of habit) could fire a selection by mistake.
     case SCREEN_HOME:
       switch (gesture) {
         case GESTURE_LEFT_TAP:
@@ -1335,9 +1345,8 @@ void dispatchGesture(ButtonGesture gesture) {
           homeSelection = (homeSelection + 1) % HOME_ITEM_COUNT;
           renderHome();
           break;
-        case GESTURE_RIGHT_HOLD: selectHomeItem(); break;
-        case GESTURE_BOTH_HOLD: enterHome(); break;
-        default: break;
+        case GESTURE_BOTH_HOLD: selectHomeItem(); break;
+        default: break;  // Right-held (go home) is a no-op here -- already Home
       }
       break;
 
@@ -1354,16 +1363,17 @@ void dispatchGesture(ButtonGesture gesture) {
             scrollChooseWindow();
             renderChooseBook();
             break;
-          case GESTURE_RIGHT_HOLD: openBook(bookList[chooseSelection]); break;
+          case GESTURE_BOTH_HOLD: openBook(bookList[chooseSelection]); break;
           case GESTURE_LEFT_HOLD: enterConfirmDelete(); break;
           default: break;
         }
       }
-      if (gesture == GESTURE_BOTH_HOLD) enterHome();
+      if (gesture == GESTURE_RIGHT_HOLD) enterHome();
       break;
 
     case SCREEN_WIFI_INFO:
-      if (gesture == GESTURE_RIGHT_HOLD || gesture == GESTURE_BOTH_HOLD) {
+      // Nothing to select on this screen -- Right-held just backs out.
+      if (gesture == GESTURE_RIGHT_HOLD) {
         exitWifiInfo();
         enterHome();
       }
@@ -1376,7 +1386,7 @@ void dispatchGesture(ButtonGesture gesture) {
           confirmDeleteYes = !confirmDeleteYes;
           renderConfirmDelete();
           break;
-        case GESTURE_RIGHT_HOLD:
+        case GESTURE_BOTH_HOLD:
           currentScreen = SCREEN_CHOOSE_BOOK;
           if (confirmDeleteYes) {
             deleteSelectedBook();  // re-renders Choose Book itself
@@ -1384,8 +1394,8 @@ void dispatchGesture(ButtonGesture gesture) {
             renderChooseBook();
           }
           break;
-        case GESTURE_BOTH_HOLD:
-          enterHome();
+        case GESTURE_RIGHT_HOLD:
+          enterHome();  // cancels without deleting
           break;
         default: break;
       }

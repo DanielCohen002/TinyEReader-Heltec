@@ -13,6 +13,7 @@ Built and compile-tested without physical access to the board at first (see `har
 - True sequential page-up/page-down (always the actual neighboring page, computed by replaying pagination rather than an undo-last-jump stack)
 - Chapter skip, using a marker character a book can contain — see [Chapters](#chapters-and-the-epub-converter) below
 - Icon-based Home screen (Resume Last Book / Choose Book / Connect to Wi-Fi) with a button-hint line, matching the CrowPanel build's layout
+- Two QR codes on the Connect to Wi-Fi screen — one auto-joins the `PocketReader` network, one links to the upload page
 - Web upload page with drag-and-drop, multi-file queueing (pre-checked against free space so a book that won't fit is skipped instead of failing mid-batch), a live library list, and per-book delete
 - Wi-Fi only powers on while the Connect to Wi-Fi screen is open — off the rest of the time (including at boot) to save battery
 - Light-sleeps the ESP32 and puts the e-paper panel to sleep after a minute of inactivity, wakes on any button press
@@ -33,7 +34,7 @@ Only 2 real buttons exist: **Left** = GPIO21/USER, **Right** = GPIO0/BOOT — co
 | | Left tap | Left hold | Right tap | Right hold | Both held |
 | --- | --- | --- | --- | --- | --- |
 | Reading a book | Previous page | Previous chapter | Next page | Next chapter | Home menu |
-| Home / Choose Book / Wi-Fi / delete dialog | Move selection | Open delete dialog (Choose Book only) | Move selection | Select / confirm | Home menu (also cancels delete without deleting) |
+| Home / Choose Book / Wi-Fi / delete dialog | Move selection | Open delete dialog (Choose Book only) | Move selection | Go Home / cancel (also cancels delete without deleting; no-op on Home itself) | Select / confirm (a deliberate two-button press, so it can't fire by accident) |
 
 ## Display driver
 
@@ -86,8 +87,8 @@ Replace `COMx` with the board's port (check Device Manager).
 ## Using it
 
 1. Flash the firmware.
-2. On the device, hold both buttons to open the Home menu, tap either button to move to **Connect to Wi-Fi**, hold Right to select it.
-3. Connect to `PocketReader`, password `12345678`.
-4. Open `http://192.168.4.1` and upload one or more `.txt` files (or converted EPUBs — see [Chapters](#chapters-and-the-epub-converter)). Uploading doesn't open a book automatically — pick one from the device's Choose Book screen.
-5. Hold Right (or Both) to back out of the Wi-Fi screen when done — Wi-Fi turns off automatically.
+2. On the device, hold both buttons to open the Home menu, tap either button to move to **Connect to Wi-Fi**, hold both buttons to select it.
+3. Scan the Wi-Fi QR code with your phone (or connect manually to `PocketReader`, password `12345678`).
+4. Open `http://192.168.4.1` (or scan the Web QR code) and upload one or more `.txt` files (or converted EPUBs — see [Chapters](#chapters-and-the-epub-converter)). Uploading doesn't open a book automatically — pick one from the device's Choose Book screen.
+5. Hold Right to back out of the Wi-Fi screen when done — Wi-Fi turns off automatically.
 6. Tap Left/Right to turn pages, hold either to jump chapters, hold both for the Home menu.
