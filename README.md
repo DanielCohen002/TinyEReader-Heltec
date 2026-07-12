@@ -4,6 +4,8 @@ A tiny Wi-Fi e-reader firmware for the [Heltec Vision Master E213](https://helte
 
 Upload `.txt` books over Wi-Fi, read them on the e-paper screen, jump between chapters, and it remembers your place in each book.
 
+**[Flash it from your browser](https://danielcohen002.github.io/TinyEReader-Heltec/)** — no Arduino IDE needed, just Chrome or Edge and a USB cable.
+
 Built and compile-tested without physical access to the board at first (see `hardware-research/heltec-e213` for the schematic/datasheet/factory-test sources every pin number and API call is drawn from), now running on real hardware. Anything the code comments still mark "verify on hardware" or "a guess" is worth double-checking against your actual board.
 
 ## Features
