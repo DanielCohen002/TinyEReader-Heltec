@@ -38,6 +38,8 @@ Only 2 real buttons exist: **Left** = GPIO21/USER, **Right** = GPIO0/BOOT — co
 
 A tap only fires once a short window (250ms, `DOUBLE_TAP_WINDOW_MS`) passes without a second tap on the same button following it — that's what makes double-tap possible, at the cost of a small delay on every single page turn. Both-held is deliberately forgiving about how simultaneously the two buttons actually go down (see `BOTH_HOLD_STAGGER_GRACE_MS` in `pollButtons()`), since two physical buttons are rarely pressed within the same tens of milliseconds of each other.
 
+Button state is tracked via GPIO interrupts (`onLeftChange`/`onRightChange`), not plain polling — a full-screen refresh blocks `loop()` for as long as the panel takes to redraw (e-paper is physically slow, ~1-2s), long enough for a quick tap's entire press-and-release to happen while nothing is polling the pins. A plain `digitalRead()` poll loop would see no edge at all when it resumes and silently drop that tap; `pollButtons()` recovers it from the interrupt-recorded timestamps instead.
+
 ## Display driver
 
 Uses Heltec's own `HT_lCMEN2R13EFC1`/`HT_E0213A367` driver classes (bundled from their Arduino library, trimmed down in `hardware-research/heltec-e213/heltec-esp32-lib-trimmed` to just the files this sketch actually needs — the full library pulls in unrelated display drivers with dependencies that aren't installed).

@@ -103,6 +103,16 @@
 #define BTN_LEFT   21  // USER
 #define BTN_RIGHT  0   // BOOT
 
+// Interrupt-maintained button state -- declared up here (rather than next
+// to the ISRs themselves, down in the BUTTONS + SLEEP section) because
+// pressed() needs them and Arduino only auto-hoists function prototypes,
+// not variable declarations, so a variable has to physically precede
+// every function that references it in the file. See onLeftChange()/
+// onRightChange() for what actually maintains these.
+volatile bool leftPinDown = false, rightPinDown = false;
+volatile unsigned long leftDownTime = 0, rightDownTime = 0;
+volatile unsigned long leftUpTime = 0, rightUpTime = 0;
+
 // ---------------- APP CONFIG ----------------
 const char* AP_NAME = "PocketReader";
 const char* AP_PASS = "12345678";
@@ -549,7 +559,13 @@ void ensureDisplayAwake() {
 }
 
 // ---------------- UTIL ----------------
+// Reads the interrupt-maintained state (see onLeftChange()/onRightChange()
+// near pollButtons()) rather than digitalRead() directly, so every caller
+// -- chord/hold detection and the reading screen's auto-repeat polling --
+// sees the same authoritative, always-up-to-date view.
 bool pressed(uint8_t pin) {
+  if (pin == BTN_LEFT) return leftPinDown;
+  if (pin == BTN_RIGHT) return rightPinDown;
   return digitalRead(pin) == LOW;
 }
 
@@ -563,6 +579,12 @@ String bookPath(const String& name) {
 
 String posPath(const String& name) {
   return "/books/" + name + ".pos";
+}
+
+// Filenames always end in ".txt" (see sanitizeFilename()) -- strip it for
+// display purposes so messages read as a title, not a filename.
+String bookTitle(const String& name) {
+  return name.endsWith(".txt") ? name.substring(0, name.length() - 4) : name;
 }
 
 String freeSpaceLabel() {
@@ -587,7 +609,7 @@ String truncateToWidth(const String& text, uint16_t maxWidth) {
 
 void showMessage(const String& message) {
   ensureDisplayAwake();
-  display->setFont(ArialMT_Plain_10);
+  display->setFont(ArialMT_Plain_16);  // matches the menu/selection screens' line size
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
 
@@ -597,7 +619,7 @@ void showMessage(const String& message) {
     int nl = message.indexOf('\n', start);
     String line = (nl == -1) ? message.substring(start) : message.substring(start, nl);
     display->drawString(2, y, line);
-    y += BOOK_LINE_HEIGHT;
+    y += MENU_LINE_HEIGHT;
     start = (nl == -1) ? message.length() : nl + 1;
   }
 
@@ -753,7 +775,11 @@ void openBook(const String& name) {
   // indexChapters() does a byte-by-byte scan of the whole file, which can take
   // a couple of seconds on a large book -- show a message first so this reads
   // as "working" rather than a frozen screen.
-  showMessage("Opening book...");
+  ensureDisplayAwake();
+  display->setFont(ArialMT_Plain_16);  // matches showMessage()'s own font, for accurate truncation
+  String prefix = "Opening ";
+  String title = truncateToWidth(bookTitle(name), BOOK_USABLE_WIDTH - display->getStringWidth(prefix));
+  showMessage(prefix + title);
 
   currentBookName = name;
   saveCurrentBookName();
@@ -1286,6 +1312,31 @@ void selectHomeItem() {
 
 // ---------------- BUTTONS + SLEEP ----------------
 
+// A full-screen refresh blocks loop() for as long as the panel takes to
+// redraw (measured in the ~1-2s range, since e-paper is physically slow
+// to update, not a driver quirk) -- long enough that a quick tap's entire
+// press-and-release can happen while nothing is polling the pins, and a
+// plain digitalRead()-based poll loop would see no edge at all when it
+// resumes (this was very likely what was breaking double-tap detection,
+// since a chapter-skip's second tap has a good chance of landing while
+// the first tap's eventual page-turn render is still finishing). GPIO
+// interrupts fire even while loop() is stuck in a blocking call, so these
+// record press/release transitions (and when they happened) in real time;
+// pollButtons() below can then recover a tap that was fully missed by
+// polling, instead of just silently dropping it. (State variables
+// themselves live up near BTN_LEFT/BTN_RIGHT -- see the comment there.)
+void IRAM_ATTR onLeftChange() {
+  bool down = (digitalRead(BTN_LEFT) == LOW);
+  if (down) leftDownTime = millis(); else leftUpTime = millis();
+  leftPinDown = down;
+}
+
+void IRAM_ATTR onRightChange() {
+  bool down = (digitalRead(BTN_RIGHT) == LOW);
+  if (down) rightDownTime = millis(); else rightUpTime = millis();
+  rightPinDown = down;
+}
+
 // How much of a head start the earlier-pressed button gets credited with
 // once the second one joins -- see the bothPressStart comment below.
 constexpr unsigned long BOTH_HOLD_STAGGER_GRACE_MS = 300;
@@ -1300,10 +1351,37 @@ ButtonGesture pollButtons() {
   static bool lastLeft = false, lastRight = false;
   static unsigned long leftPressStart = 0, rightPressStart = 0, bothPressStart = 0;
   static bool leftResolved = false, rightResolved = false, bothResolved = false;
+  static unsigned long lastSeenLeftDown = 0, lastSeenRightDown = 0;
+  static unsigned long lastSeenLeftUp = 0, lastSeenRightUp = 0;
 
-  bool nowLeft = pressed(BTN_LEFT);
-  bool nowRight = pressed(BTN_RIGHT);
+  bool nowLeft = leftPinDown;
+  bool nowRight = rightPinDown;
   unsigned long now = millis();
+
+  // Recover a tap whose entire press-and-release happened between two
+  // polls (see the interrupt comment above): both its down and up
+  // timestamps are new at the same time, which can't happen for a tap
+  // that was actually observed live (the down edge would already have
+  // been consumed on an earlier poll, well before the up edge arrives).
+  // A press that's still down, or one long enough to have been a hold,
+  // doesn't qualify -- only a short, fully-missed press does.
+  bool leftBothNew = (leftDownTime != lastSeenLeftDown) && (leftUpTime != lastSeenLeftUp) && (leftUpTime > leftDownTime);
+  bool rightBothNew = (rightDownTime != lastSeenRightDown) && (rightUpTime != lastSeenRightUp) && (rightUpTime > rightDownTime);
+  lastSeenLeftDown = leftDownTime;
+  lastSeenLeftUp = leftUpTime;
+  lastSeenRightDown = rightDownTime;
+  lastSeenRightUp = rightUpTime;
+
+  bool leftCoalesced = leftBothNew && !nowLeft && (leftUpTime - leftDownTime) < HOLD_THRESHOLD_MS;
+  bool rightCoalesced = rightBothNew && !nowRight && (rightUpTime - rightDownTime) < HOLD_THRESHOLD_MS;
+  if (leftCoalesced || rightCoalesced) {
+    lastLeft = nowLeft;
+    lastRight = nowRight;
+    // Only one gesture fits in the return value -- if both buttons somehow
+    // had a fully-missed tap in the same gap (rare), Left wins and Right's
+    // is still dropped, same as before this recovery existed.
+    return leftCoalesced ? GESTURE_LEFT_TAP : GESTURE_RIGHT_TAP;
+  }
 
   if (nowLeft && !lastLeft) { leftPressStart = now; leftResolved = false; }
   if (nowRight && !lastRight) { rightPressStart = now; rightResolved = false; }
@@ -1550,6 +1628,12 @@ void setup() {
 
   pinMode(BTN_LEFT, INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT_PULLUP);
+  // Seed from a direct read since pressed() now just returns these same
+  // variables -- can't bootstrap their initial value through itself.
+  leftPinDown = (digitalRead(BTN_LEFT) == LOW);
+  rightPinDown = (digitalRead(BTN_RIGHT) == LOW);
+  attachInterrupt(digitalPinToInterrupt(BTN_LEFT), onLeftChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_RIGHT), onRightChange, CHANGE);
 
   VextON();
   delay(100);
