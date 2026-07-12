@@ -61,13 +61,16 @@ The board has 16MB of flash. `firmware/HeltecVisionMasterE213/partitions.csv` gi
 
 Plain `.txt` has no concept of chapters, so the firmware looks for a form-feed byte (`0x0C`, `'\f'`) in the book to mark chapter boundaries — invisible in the rendered text, just a jump point for the buttons while reading. A hand-typed `.txt` with no form feeds just has one implicit chapter.
 
-`tools/epub_to_txt.py` converts an EPUB to a `.txt` with these markers already inserted, using the book's real chapter headings (`<h1>`/`<h2>`/`<h3>`) when present, or one marker per internal chapter file as a fallback:
+This board's upload page doesn't convert EPUBs on the fly (that's only implemented on the [CrowPanel build](https://github.com/DanielCohen002/TinyEReader-CrowPanel), where development has moved) — convert first with either:
+
+- **[The standalone browser converter](https://danielcohen002.github.io/TinyEReader-Heltec/epub-to-txt.html)** — runs entirely client-side, drop an EPUB in and download the `.txt`.
+- `tools/epub_to_txt.py` (Python, no dependencies) --
 
 ```powershell
 py tools\epub_to_txt.py yourbook.epub
 ```
 
-Writes `yourbook.txt` next to it — upload that the normal way.
+Both use the book's real chapter headings (`<h1>`/`<h2>`/`<h3>`) when present, or one marker per internal chapter file as a fallback, and write `yourbook.txt` next to the source (for the Python version) — upload that the normal way.
 
 ## Building
 

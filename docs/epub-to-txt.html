@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EPUB to TXT converter</title>
+  <script src="epub-to-txt.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 640px;
+      margin: 3rem auto;
+      padding: 0 1.5rem;
+      line-height: 1.5;
+      color: #1a1a1a;
+    }
+    h1 { font-size: 1.4rem; }
+    .drop {
+      display: block; box-sizing: border-box;
+      border: 2px dashed #999; border-radius: 8px; padding: 2rem 1rem;
+      text-align: center; cursor: pointer; margin: 1.5rem 0;
+    }
+    .drop.drag { border-color: #1a73e8; background: #f0f6ff; }
+    input[type=file] { display: none; }
+    .files { margin-top: 1rem; font-size: 0.95rem; }
+    .file-row { display: flex; justify-content: space-between; gap: 0.5rem; padding: 0.3rem 0; border-top: 1px solid #eee; }
+    .file-row a { color: #1a73e8; }
+    .file-row .error { color: #b03a2e; }
+    .note {
+      background: #f5f5f5;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      font-size: 0.95rem;
+      margin-top: 2rem;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #171512; color: #ece7dc; }
+      .drop { border-color: #4a4438; }
+      .drop.drag { border-color: #8ab4f8; background: #1c2733; }
+      .file-row { border-top-color: #332e27; }
+      .note { background: #201d19; }
+    }
+  </style>
+</head>
+<body>
+  <h1>EPUB → TXT converter</h1>
+  <p>Converts an EPUB to the plain-<code>.txt</code> format this reader's firmware expects, with chapter markers inserted at real headings. Runs entirely in your browser — nothing is uploaded anywhere.</p>
+
+  <label class="drop" id="drop" for="file">
+    <p>Tap to choose EPUBs, or drag &amp; drop them here</p>
+  </label>
+  <input type="file" id="file" accept=".epub,application/epub+zip" multiple>
+
+  <div class="files" id="files"></div>
+
+  <div class="note">
+    <strong>Note:</strong> this board's upload page doesn't convert EPUBs automatically (that's only implemented on the <a href="https://github.com/DanielCohen002/TinyEReader-CrowPanel">CrowPanel build</a>) — convert here first, then upload the resulting <code>.txt</code> the normal way.
+  </div>
+
+  <script>
+    var drop = document.getElementById('drop');
+    var fileInput = document.getElementById('file');
+    var filesBox = document.getElementById('files');
+
+    function handleFiles(fileList) {
+      Array.prototype.forEach.call(fileList, function (file) {
+        if (!/\.epub$/i.test(file.name)) return;
+        var row = document.createElement('div');
+        row.className = 'file-row';
+        var name = document.createElement('span');
+        name.textContent = file.name;
+        var status = document.createElement('span');
+        status.textContent = 'Converting...';
+        row.appendChild(name);
+        row.appendChild(status);
+        filesBox.appendChild(row);
+
+        file.arrayBuffer().then(function (buf) {
+          return window.epubToTxt(buf);
+        }).then(function (text) {
+          var blob = new Blob([text], { type: 'text/plain' });
+          var url = URL.createObjectURL(blob);
+          var link = document.createElement('a');
+          link.href = url;
+          link.download = file.name.replace(/\.epub$/i, '.txt');
+          link.textContent = 'Download ' + link.download;
+          status.replaceWith(link);
+        }).catch(function (err) {
+          status.textContent = 'Failed: ' + err.message;
+          status.className = 'error';
+          console.error(err);
+        });
+      });
+    }
+
+    fileInput.addEventListener('change', function () { handleFiles(fileInput.files); });
+    ['dragenter', 'dragover'].forEach(function (evt) {
+      drop.addEventListener(evt, function (e) { e.preventDefault(); drop.classList.add('drag'); });
+    });
+    ['dragleave', 'drop'].forEach(function (evt) {
+      drop.addEventListener(evt, function (e) { e.preventDefault(); drop.classList.remove('drag'); });
+    });
+    drop.addEventListener('drop', function (e) { handleFiles(e.dataTransfer.files); });
+  </script>
+</body>
+</html>
