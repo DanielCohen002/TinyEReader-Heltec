@@ -55,7 +55,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
-#include <esp_system.h>
 #include "HT_lCMEN2R13EFC1.h"
 #include "HT_E0213A367.h"
 
@@ -91,7 +90,12 @@ const char* AP_PASS = "12345678";
 // roughly 13.9MB of this board's 16MB flash.
 constexpr size_t MAX_BOOK_SIZE = 5 * 1024 * 1024;
 constexpr uint32_t SLEEP_AFTER_MS = 60000;
-constexpr uint8_t MAX_BOOKS = 8;  // Choose Book's list isn't scrollable yet
+// Book count is bounded by flash space, not an arbitrary limit -- see
+// uploadSizeLimit in handleUpload(). MAX_BOOKS is just the bookList array's
+// capacity (RAM, not flash). The Choose Book screen only fits
+// CHOOSE_VISIBLE_ROWS at a time and scrolls to show more.
+constexpr uint8_t MAX_BOOKS = 64;
+constexpr uint8_t CHOOSE_VISIBLE_ROWS = 8;  // one row is a free-space header, see renderChooseBook()
 
 constexpr unsigned long HOLD_THRESHOLD_MS = 500;  // tap vs. hold cutoff for both buttons
 
@@ -135,7 +139,9 @@ uint8_t homeSelection = 0;
 
 String bookList[MAX_BOOKS];
 uint8_t bookCount = 0;
+uint8_t bookFileTotal = 0;  // like bookCount but not capped at MAX_BOOKS -- see listBooks()
 uint8_t chooseSelection = 0;
+uint8_t chooseWindowStart = 0;  // first bookList index shown on screen, see scrollChooseWindow()
 bool confirmDeleteYes = false;  // defaults to No -- the safe choice
 
 String currentBookName;  // filename only, e.g. "MyNovel.txt" -- lives under /books/
@@ -162,17 +168,256 @@ const char uploadPage[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>PocketReader</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.35; }
-    input, button { font: inherit; margin-top: 1rem; }
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, sans-serif; line-height: 1.4; margin: 0;
+      padding: 2rem 1rem; background: #f2efe9; color: #1c1a17;
+      display: flex; justify-content: center;
+    }
+    .card {
+      width: 100%; max-width: 26rem; background: #fffdf9;
+      border-radius: 0.75rem; padding: 1.5rem 1.5rem 1.75rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+    .sub { color: #6b6357; font-size: 0.9rem; margin: 0 0 1.25rem; }
+    .drop {
+      display: block; box-sizing: border-box;
+      border: 2px dashed #c9c0b0; border-radius: 0.6rem; padding: 1.5rem 1rem;
+      text-align: center; cursor: pointer; transition: border-color 0.15s, background 0.15s;
+    }
+    .drop.drag { border-color: #8a7a5c; background: #f6f1e6; }
+    .drop p { margin: 0.25rem 0; }
+    .drop .hint { font-size: 0.85rem; color: #8a8072; }
+    input[type=file] { display: none; }
+    button {
+      font: inherit; margin-top: 1rem; width: 100%; padding: 0.65rem;
+      border: none; border-radius: 0.5rem; background: #3d3527; color: #fff;
+      cursor: pointer;
+    }
+    button:disabled { background: #b6ac9a; cursor: not-allowed; }
+    .files { margin-top: 1rem; font-size: 0.9rem; }
+    .file-row { display: flex; justify-content: space-between; gap: 0.5rem; padding: 0.15rem 0; }
+    .file-row .status { color: #8a8072; white-space: nowrap; }
+    .file-row.done .status { color: #3c7a3c; }
+    .file-row.error .status { color: #b03a2e; }
+    h2 { font-size: 1rem; margin: 1.75rem 0 0.5rem; }
+    .lib-meta { font-size: 0.85rem; color: #6b6357; margin: 0 0 0.5rem; }
+    ul.lib { list-style: none; margin: 0; padding: 0; font-size: 0.9rem; }
+    ul.lib li { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0; border-top: 1px solid #ece7dc; }
+    ul.lib li .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    ul.lib li .size { color: #8a8072; white-space: nowrap; }
+    ul.lib li .del {
+      flex: none; width: auto; margin-top: 0; padding: 0.2rem 0.55rem; font-size: 0.8rem;
+      border: 1px solid #c9c0b0; border-radius: 0.35rem; background: transparent; color: #8a6b5c;
+    }
+    ul.lib li .del:hover { border-color: #b03a2e; color: #b03a2e; }
+    .empty { color: #8a8072; font-size: 0.9rem; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #171512; color: #ece7dc; }
+      .card { background: #201d19; box-shadow: none; }
+      .sub, .lib-meta, .empty, .drop .hint, .file-row .status { color: #a49b8a; }
+      .drop { border-color: #4a4438; }
+      .drop.drag { border-color: #8a7a5c; background: #2a251e; }
+      button { background: #ece7dc; color: #201d19; }
+      button:disabled { background: #4a4438; color: #a49b8a; }
+      ul.lib li { border-top-color: #332e27; }
+      ul.lib li .del { border-color: #4a4438; color: #c9b8a8; background: transparent; }
+      ul.lib li .del:hover { border-color: #d47a6a; color: #d47a6a; }
+    }
   </style>
 </head>
 <body>
-  <h1>PocketReader</h1>
-  <p>Uploading adds a new book to your library. It becomes the active book right away.</p>
-  <form method="POST" action="/upload" enctype="multipart/form-data">
-    <input type="file" name="file" accept=".txt,text/plain">
-    <button type="submit">Upload TXT</button>
-  </form>
+  <div class="card">
+    <h1>PocketReader</h1>
+    <p class="sub">Upload one or more .txt books. Open a book from the device's Choose Book screen.</p>
+
+    <form id="form">
+      <label class="drop" id="drop" for="file">
+        <p id="dropLabel">Tap to choose books</p>
+        <p class="hint">or drag &amp; drop .txt files here</p>
+      </label>
+      <input type="file" id="file" name="file" accept=".txt,text/plain" multiple>
+      <button type="submit" id="go" disabled>Upload</button>
+    </form>
+    <div class="files" id="files"></div>
+
+    <h2>Library</h2>
+    <p class="lib-meta" id="libMeta">Loading...</p>
+    <ul class="lib" id="libList"></ul>
+  </div>
+
+  <script>
+    var fileInput = document.getElementById('file');
+    var drop = document.getElementById('drop');
+    var dropLabel = document.getElementById('dropLabel');
+    var go = document.getElementById('go');
+    var filesBox = document.getElementById('files');
+    var form = document.getElementById('form');
+    var picked = [];
+
+    function fmtSize(n) {
+      if (n > 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + 'MB';
+      if (n > 1024) return Math.round(n / 1024) + 'KB';
+      return n + 'B';
+    }
+
+    function refreshLibrary() {
+      fetch('/books').then(function (r) { return r.json(); }).then(function (data) {
+        var meta = data.count + ' book' + (data.count === 1 ? '' : 's') + ' - ' + data.free;
+        if (data.hidden > 0) {
+          meta += ' (+' + data.hidden + ' more on the device you can\'t see or delete here - ' +
+            'delete a visible book to make room, which will reveal one of them)';
+        }
+        document.getElementById('libMeta').textContent = meta;
+        var list = document.getElementById('libList');
+        list.innerHTML = '';
+        if (data.books.length === 0) {
+          var li = document.createElement('li');
+          li.className = 'empty';
+          li.textContent = 'No books yet.';
+          list.appendChild(li);
+        }
+        data.books.forEach(function (b) {
+          var li = document.createElement('li');
+          var name = document.createElement('span');
+          name.className = 'name';
+          name.textContent = b.name;
+          var size = document.createElement('span');
+          size.className = 'size';
+          size.textContent = fmtSize(b.size);
+          var del = document.createElement('button');
+          del.type = 'button';
+          del.className = 'del';
+          del.textContent = 'Delete';
+          del.addEventListener('click', function () { deleteBook(b.name); });
+          li.appendChild(name);
+          li.appendChild(size);
+          li.appendChild(del);
+          list.appendChild(li);
+        });
+      }).catch(function () {
+        document.getElementById('libMeta').textContent = '';
+      });
+    }
+
+    function deleteBook(name) {
+      if (!confirm('Delete "' + name + '"? This can\'t be undone.')) return;
+      fetch('/delete?name=' + encodeURIComponent(name), { method: 'POST' })
+        .then(refreshLibrary)
+        .catch(refreshLibrary);
+    }
+
+    function setPicked(fileList) {
+      picked = Array.prototype.filter.call(fileList, function (f) {
+        return f.name.toLowerCase().endsWith('.txt');
+      });
+      dropLabel.textContent = picked.length === 0
+        ? 'Tap to choose books'
+        : picked.length + ' book' + (picked.length > 1 ? 's' : '') + ' selected';
+      go.disabled = picked.length === 0;
+      filesBox.innerHTML = '';
+    }
+
+    fileInput.addEventListener('change', function () { setPicked(fileInput.files); });
+
+    ['dragenter', 'dragover'].forEach(function (evt) {
+      drop.addEventListener(evt, function (e) { e.preventDefault(); drop.classList.add('drag'); });
+    });
+    ['dragleave', 'drop'].forEach(function (evt) {
+      drop.addEventListener(evt, function (e) { e.preventDefault(); drop.classList.remove('drag'); });
+    });
+    drop.addEventListener('drop', function (e) {
+      setPicked(e.dataTransfer.files);
+    });
+
+    function addFileRow(file) {
+      var row = document.createElement('div');
+      row.className = 'file-row';
+      var name = document.createElement('span');
+      name.textContent = file.name;
+      var status = document.createElement('span');
+      status.className = 'status';
+      row.appendChild(name);
+      row.appendChild(status);
+      filesBox.appendChild(row);
+      return { row: row, status: status };
+    }
+
+    function uploadOne(file) {
+      return new Promise(function (resolve) {
+        var r = addFileRow(file);
+        r.status.textContent = '0%';
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/upload');
+        xhr.upload.onprogress = function (e) {
+          if (e.lengthComputable) r.status.textContent = Math.round((e.loaded / e.total) * 100) + '%';
+        };
+        xhr.onload = function () {
+          if (xhr.status === 200) {
+            r.row.classList.add('done');
+            r.status.textContent = 'Done';
+          } else {
+            r.row.classList.add('error');
+            r.status.textContent = xhr.status === 413 ? 'Too large' : 'Failed';
+          }
+          resolve();
+        };
+        xhr.onerror = function () {
+          r.row.classList.add('error');
+          r.status.textContent = 'Failed';
+          resolve();
+        };
+        var data = new FormData();
+        data.append('file', file);
+        xhr.send(data);
+      });
+    }
+
+    // Mirrors handleUpload()'s own acceptance check (min(maxSize, freeBytes -
+    // 8192), freeBytes shrinking as earlier books in the queue are counted)
+    // so books that can't possibly fit are rejected up front instead of
+    // failing partway through a batch after using up real upload time.
+    function planQueue(files, freeBytes, maxSize) {
+      var available = freeBytes;
+      return files.map(function (file) {
+        var allowed = available > 8192 ? Math.min(maxSize, available - 8192) : 0;
+        var fits = file.size <= allowed;
+        if (fits) available -= file.size;
+        return fits;
+      });
+    }
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      if (picked.length === 0) return;
+      go.disabled = true;
+      filesBox.innerHTML = '';
+
+      fetch('/books').then(function (r) { return r.json(); }).then(function (data) {
+        var fits = planQueue(picked, data.freeBytes, data.maxSize);
+        var chain = Promise.resolve();
+        picked.forEach(function (file, i) {
+          if (fits[i]) {
+            chain = chain.then(function () { return uploadOne(file); });
+          } else {
+            var r = addFileRow(file);
+            r.row.classList.add('error');
+            r.status.textContent = "Won't fit - skipped";
+          }
+        });
+        return chain;
+      }).then(function () {
+        picked = [];
+        fileInput.value = '';
+        dropLabel.textContent = 'Tap to choose books';
+        refreshLibrary();
+      });
+    });
+
+    refreshLibrary();
+  </script>
 </body>
 </html>
 )rawliteral";
@@ -278,6 +523,13 @@ String posPath(const String& name) {
   return "/books/" + name + ".pos";
 }
 
+String freeSpaceLabel() {
+  size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%uKB free", (unsigned)(freeBytes / 1024));
+  return String(buf);
+}
+
 constexpr float BATTERY_ADC_RESOLUTION = 1.0f / 4096.0f;
 constexpr float BATTERY_ADC_REF_V = 3.3f;
 constexpr float BATTERY_DIVIDER_COEFFICIENT = 4.01f;  // from Heltec's own factory-test formula
@@ -373,26 +625,33 @@ void reopenBookAt(uint32_t offset) {
 
 void listBooks() {
   bookCount = 0;
+  bookFileTotal = 0;
   File dir = LittleFS.open("/books");
   if (!dir || !dir.isDirectory()) return;
 
+  // Keeps counting past MAX_BOOKS (into bookFileTotal) even once bookList is
+  // full, so any book that can't fit in the RAM array is surfaced instead of
+  // silently vanishing while still eating flash space.
   File f = dir.openNextFile();
-  while (f && bookCount < MAX_BOOKS) {
+  while (f) {
     String name = String(f.name());
     int slash = name.lastIndexOf('/');
     if (slash != -1) name = name.substring(slash + 1);
     if (name.length() > 0 && !name.endsWith(".pos")) {
-      bookList[bookCount++] = name;
+      if (bookCount < MAX_BOOKS) bookList[bookCount++] = name;
+      bookFileTotal++;
     }
     f = dir.openNextFile();
   }
 }
 
 void renderChooseBook();
+void scrollChooseWindow();
 
-void deleteSelectedBook() {
-  if (bookCount == 0) return;
-  String name = bookList[chooseSelection];
+// Shared by the on-device delete flow and the web /delete endpoint. Returns
+// false if the book didn't exist (nothing to delete).
+bool deleteBookFile(const String& name) {
+  if (!LittleFS.exists(bookPath(name))) return false;
 
   if (name == currentBookName) {
     if (book) book.close();
@@ -402,6 +661,12 @@ void deleteSelectedBook() {
 
   LittleFS.remove(bookPath(name));
   LittleFS.remove(posPath(name));
+  return true;
+}
+
+void deleteSelectedBook() {
+  if (bookCount == 0) return;
+  deleteBookFile(bookList[chooseSelection]);
 
   listBooks();
   if (bookCount == 0) {
@@ -409,6 +674,7 @@ void deleteSelectedBook() {
   } else if (chooseSelection >= bookCount) {
     chooseSelection = bookCount - 1;
   }
+  scrollChooseWindow();
   renderChooseBook();
 }
 
@@ -451,6 +717,11 @@ void previousChapter() {
 }
 
 void openBook(const String& name) {
+  // indexChapters() does a byte-by-byte scan of the whole file, which can take
+  // a couple of seconds on a large book -- show a message first so this reads
+  // as "working" rather than a frozen screen.
+  showMessage("Opening book...");
+
   currentBookName = name;
   saveCurrentBookName();
   uint32_t saved = loadSavedPosition(name);
@@ -469,6 +740,36 @@ void setupAP() {
 void handleRoot() {
   touchActivity();
   server.send(200, "text/html", uploadPage);
+}
+
+// Hand-built JSON (no ArduinoJson dependency) so the upload page can show
+// the current library without a page reload. bookCount is capped at
+// MAX_BOOKS by listBooks(), so this stays small and fast even though it
+// opens each file just to read its size.
+void handleBooksList() {
+  touchActivity();
+  listBooks();
+
+  String json = "{\"books\":[";
+  for (uint8_t i = 0; i < bookCount; i++) {
+    if (i > 0) json += ",";
+    File f = LittleFS.open(bookPath(bookList[i]), "r");
+    size_t size = f ? f.size() : 0;
+    if (f) f.close();
+    json += "{\"name\":\"" + bookList[i] + "\",\"size\":" + String(size) + "}";
+  }
+  // freeBytes/maxSize let the upload page simulate handleUpload()'s own
+  // acceptance math (min(MAX_BOOK_SIZE, freeSpace - 8192)) client-side, so
+  // it can reject queued books that won't fit before even starting the
+  // upload instead of finding out partway through a batch.
+  size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+  json += "],\"count\":" + String(bookCount) +
+          ",\"hidden\":" + String(bookFileTotal > bookCount ? bookFileTotal - bookCount : 0) +
+          ",\"free\":\"" + freeSpaceLabel() + "\"" +
+          ",\"freeBytes\":" + String(freeBytes) +
+          ",\"maxSize\":" + String(MAX_BOOK_SIZE) + "}";
+
+  server.send(200, "application/json", json);
 }
 
 String sanitizeFilename(String name) {
@@ -528,16 +829,32 @@ void handleUpload() {
 
 void handleUploadComplete() {
   if (tooLarge) {
-    server.send(413, "text/plain", "File too large or library full");
+    server.send(413, "text/plain", "File too large (limit 5MB per book, or not enough free space)");
     return;
   }
 
-  openBook(uploadName);
+  // Deliberately doesn't open the book -- uploading just adds it to the
+  // library so the page stays put for uploading more. Open it from the
+  // device's Choose Book screen.
   server.send(200, "text/plain", "Upload complete: " + uploadName);
+}
+
+void handleDeleteBook() {
+  touchActivity();
+  // Reuses the same sanitizer as uploads so this can't be pointed outside
+  // /books via the name query param.
+  String name = sanitizeFilename(server.arg("name"));
+  if (!deleteBookFile(name)) {
+    server.send(404, "text/plain", "Book not found: " + name);
+    return;
+  }
+  server.send(200, "text/plain", "Deleted: " + name);
 }
 
 void registerWebRoutes() {
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/books", HTTP_GET, handleBooksList);
+  server.on("/delete", HTTP_POST, handleDeleteBook);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
 }
 
@@ -729,11 +1046,6 @@ uint32_t findPreviousPageStart(uint32_t currentStart) {
 }
 
 void renderPageAt(uint32_t offset) {
-  if (currentBookName.length() == 0 || !LittleFS.exists(bookPath(currentBookName))) {
-    showMessage("Upload a TXT at\nhttp://192.168.4.1\nor hold both buttons\nfor the Home menu");
-    return;
-  }
-
   reopenBookAt(offset);
   if (!book) {
     showMessage("Book open failed");
@@ -794,27 +1106,48 @@ void renderHome() {
   display->display();
 }
 
+// Keeps chooseSelection inside [chooseWindowStart, chooseWindowStart +
+// CHOOSE_VISIBLE_ROWS) by scrolling the window the minimum amount needed --
+// called whenever chooseSelection or bookCount changes.
+void scrollChooseWindow() {
+  if (chooseSelection < chooseWindowStart) {
+    chooseWindowStart = chooseSelection;
+  } else if (chooseSelection >= chooseWindowStart + CHOOSE_VISIBLE_ROWS) {
+    chooseWindowStart = chooseSelection - CHOOSE_VISIBLE_ROWS + 1;
+  }
+  uint8_t maxStart = (bookCount > CHOOSE_VISIBLE_ROWS) ? bookCount - CHOOSE_VISIBLE_ROWS : 0;
+  if (chooseWindowStart > maxStart) chooseWindowStart = maxStart;
+}
+
+// Row 0 is a free-space header (plus ^/v hints when the list scrolls); the
+// book list starts one row down and shows at most CHOOSE_VISIBLE_ROWS at a
+// time.
 void renderChooseBook() {
   ensureDisplayAwake();
   display->setFont(ArialMT_Plain_10);
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
 
-  size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
-  char freeBuf[24];
-  snprintf(freeBuf, sizeof(freeBuf), "%uKB free", (unsigned)(freeBytes / 1024));
-  display->drawString(MENU_LEFT_MARGIN, 2, freeBuf);
+  String header = freeSpaceLabel();
+  if (bookCount > CHOOSE_VISIBLE_ROWS) {
+    header += "  ";
+    header += (chooseWindowStart > 0) ? "^" : " ";
+    header += (chooseWindowStart + CHOOSE_VISIBLE_ROWS < bookCount) ? "v" : " ";
+  }
+  display->drawString(MENU_LEFT_MARGIN, 2, header);
 
   if (bookCount == 0) {
     display->drawString(MENU_LEFT_MARGIN, 2 + MENU_LINE_HEIGHT, "No books yet.");
     display->drawString(MENU_LEFT_MARGIN, 2 + 2 * MENU_LINE_HEIGHT, "Upload one first.");
   } else {
-    for (uint8_t i = 0; i < bookCount; i++) {
+    uint8_t windowEnd = min((uint8_t)(chooseWindowStart + CHOOSE_VISIBLE_ROWS), bookCount);
+    for (uint8_t i = chooseWindowStart; i < windowEnd; i++) {
+      uint8_t row = i - chooseWindowStart;
       String label = (i == chooseSelection) ? "> " : "  ";
       String name = bookList[i];
       if (name.length() > 34) name = name.substring(0, 31) + "...";
       label += name;
-      display->drawString(MENU_LEFT_MARGIN, 2 + (i + 1) * MENU_LINE_HEIGHT, label);
+      display->drawString(MENU_LEFT_MARGIN, 2 + (row + 1) * MENU_LINE_HEIGHT, label);
     }
   }
 
@@ -899,6 +1232,7 @@ void selectHomeItem() {
     case 1:  // Choose Book
       listBooks();
       chooseSelection = 0;
+      chooseWindowStart = 0;
       currentScreen = SCREEN_CHOOSE_BOOK;
       renderChooseBook();
       break;
@@ -990,10 +1324,12 @@ void dispatchGesture(ButtonGesture gesture) {
         switch (gesture) {
           case GESTURE_LEFT_TAP:
             chooseSelection = (chooseSelection + bookCount - 1) % bookCount;
+            scrollChooseWindow();
             renderChooseBook();
             break;
           case GESTURE_RIGHT_TAP:
             chooseSelection = (chooseSelection + 1) % bookCount;
+            scrollChooseWindow();
             renderChooseBook();
             break;
           case GESTURE_RIGHT_HOLD: openBook(bookList[chooseSelection]); break;
@@ -1070,17 +1406,6 @@ void setup() {
   pinMode(BTN_LEFT, INPUT_PULLUP);
   pinMode(BTN_RIGHT, INPUT_PULLUP);
 
-  // One-shot: if this boot was caused by physically pressing the Reset
-  // button (not a normal power-on), land on the Home menu instead of
-  // resuming the last book -- a hard "start over" escape hatch, since
-  // Reset can't be read as a normal button during a running session (see
-  // file header). ESP_RST_EXT is the specific reason code for an external
-  // reset pin toggle; whether this board's reset circuit actually reports
-  // that (vs. e.g. ESP_RST_POWERON) wasn't something I could verify without
-  // hardware -- if it turns out wrong, this simply never fires rather than
-  // firing on every normal power-on, which is the safer failure direction.
-  bool bootedFromResetButton = (esp_reset_reason() == ESP_RST_EXT);
-
   VextON();
   delay(100);
   probeAndCreateDisplay();
@@ -1102,16 +1427,13 @@ void setup() {
     currentBookName = (bookCount > 0) ? bookList[0] : "";
   }
 
+  // Loads/indexes the last book (if any) so Resume Last Book is instant,
+  // but boots to the Home screen rather than straight into reading.
   uint32_t saved = currentBookName.length() > 0 ? loadSavedPosition(currentBookName) : 0;
   reopenBookAt(saved);
   indexChapters();
-
-  if (bootedFromResetButton && currentBookName.length() > 0) {
-    enterHome();
-  } else {
-    currentScreen = SCREEN_READING;
-    renderPageAt(saved);
-  }
+  currentScreen = SCREEN_HOME;
+  renderHome();
 }
 
 void loop() {
