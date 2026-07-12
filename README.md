@@ -1,65 +1,53 @@
-# TinyEReader
+# TinyEReader (Heltec Vision Master E213)
 
-A tiny Wi-Fi e-reader firmware for the [Elecrow CrowPanel ESP32 E-Paper HMI 2.13"](https://github.com/Elecrow-RD/CrowPanel-ESP32-2.13-E-paper-HMI-Display-with-122-250) (model DIE01021S).
+A tiny Wi-Fi e-reader firmware for the [Heltec Vision Master E213](https://heltec.org/project/vision-master-e213/) (ESP32-S3 + SX1262 LoRa + 2.13" e-paper). This is a from-scratch port of [TinyEReader](https://github.com/DanielCohen002/TinyEReader-CrowPanel), originally built for the Elecrow CrowPanel ESP32 E-Paper HMI 2.13", to this different board.
 
 Upload `.txt` books over Wi-Fi, read them on the e-paper screen, jump between chapters, and it remembers your place in each book.
 
+Built and compile-tested without physical access to the board at first (see `hardware-research/heltec-e213` for the schematic/datasheet/factory-test sources every pin number and API call is drawn from), now running on real hardware. Anything the code comments still mark "verify on hardware" or "a guess" is worth double-checking against your actual board.
+
 ## Features
 
-- Multi-book library: each upload adds a book rather than replacing one, up to 3MB per book
-- Remembers your reading position per book, boots straight back into whichever book you read last
-- True sequential page-up/page-down (always the actual neighboring page, computed by replaying pagination rather than an undo-last-jump stack) — see [Display driver](#display-driver)
+- Multi-book library: each upload adds a book rather than replacing one, up to 5MB per book (limited by free space, not a book-count cap)
+- Remembers your reading position per book; boots to the Home screen (not straight into reading)
+- True sequential page-up/page-down (always the actual neighboring page, computed by replaying pagination rather than an undo-last-jump stack)
 - Chapter skip, using a marker character a book can contain — see [Chapters](#chapters-and-the-epub-converter) below
-- Home menu: a row of three icons (Resume Last Book / Choose Book / Connect to Wi-Fi) with small labels underneath, selection shown as a border box. Free space left in the library shows on Choose Book only (Home and Choose Book could report a hair apart due to LittleFS's own block-level accounting, so it's shown in one place, the more conservative of the two, instead of two possibly-inconsistent ones)
-- Delete a book from Choose Book via a Yes/No confirmation dialog
-- Two QR codes on the Connect to Wi-Fi screen — one auto-joins the `PocketReader` network, one links out to the project — generated from PNGs with `tools/image_to_epd.py`
+- Real battery percentage on the Home screen, read from the board's own ADC
+- Web upload page with drag-and-drop, multi-file queueing (pre-checked against free space so a book that won't fit is skipped instead of failing mid-batch), a live library list, and per-book delete
 - Wi-Fi only powers on while the Connect to Wi-Fi screen is open — off the rest of the time (including at boot) to save battery
 - Light-sleeps the ESP32 and puts the e-paper panel to sleep after a minute of inactivity, wakes on any button press
 
-## Hardware
+## Hardware differences from the CrowPanel build
 
-| Board feature | GPIO |
-| --- | --- |
-| Menu button (top) | 2 |
-| Back / Exit button (bottom) | 1 |
-| Dial rotate down | 4 |
-| Dial rotate up | 6 |
-| Dial press | 5 |
-| Display power enable | 7 |
-| E-paper SCK | 12 |
-| E-paper MOSI | 11 |
-| E-paper RST | 10 |
-| E-paper DC | 13 |
-| E-paper CS | 14 |
-| E-paper BUSY | 9 |
+- Only 2 software-readable buttons exist (not the CrowPanel's 5 inputs). The board has a 3rd physical button (Reset), but it's wired straight to the chip's hardware EN pin, not a GPIO — pressing it just restarts the chip, so software can't read it as a normal button.
+- Real battery voltage sensing exists (GPIO7, ADC) — the CrowPanel had none at all.
+- The display driver is Heltec's own library (proportional fonts, built-in word-wrap) rather than a fixed-width character blitter.
+- This board ships with one of two possible e-paper controller chips depending on manufacturing batch — detected at runtime via a raw SPI chip-ID probe, exactly as Heltec's own example does it.
+- 16MB flash (double the CrowPanel's 8MB), so the custom partition table here gives LittleFS roughly 13.9MB.
+- Both boards' charge-status LEDs (orange on this one) are wired directly to the charger chip's status pins, not to any ESP32 GPIO — there's no way for firmware to read or control charging state on either board.
 
-The BOOT button (GPIO0) and REST/RESET button are hardware-level (bootloader / reset) and aren't read by the sketch.
+## Buttons
 
-Button meaning depends on which screen is showing:
+Only 2 real buttons exist: **Left** = GPIO0/BOOT, **Right** = GPIO21/USER. Which physical side is actually "left" vs "right" was a guess made without the board in hand — swap the `BTN_LEFT`/`BTN_RIGHT` `#define`s near the top of the `.ino` if it's backwards on yours.
 
-| | Top | Bottom | Dial rotate | Dial press |
-| --- | --- | --- | --- | --- |
-| Reading a book | Previous page (hold to repeat) | Next page (hold to repeat) | Up = previous chapter, down = next chapter | Open Home menu |
-| Home / Choose Book / delete dialog | Jump to Home (cancels the delete dialog without deleting) | On a book in Choose Book, opens the delete dialog | Move selection up/down | Select highlighted item |
-| Connect to Wi-Fi | Back to Home | — | — | Back to Home |
+| | Left tap | Left hold | Right tap | Right hold | Both held |
+| --- | --- | --- | --- | --- | --- |
+| Reading a book | Previous page | Previous chapter | Next page | Next chapter | Home menu |
+| Home / Choose Book / Wi-Fi / delete dialog | Move selection | Open delete dialog (Choose Book only) | Move selection | Select / confirm | Home menu (also cancels delete without deleting) |
 
 ## Display driver
 
-The sketch does **not** use GxEPD2. This panel ships with either an SSD1680Z or JD79661 controller depending on manufacturing batch, and only Elecrow's own driver is confirmed to handle both correctly. `firmware/TinyEReader/EPD*.{h,cpp}` and `spi.{h,cpp}` are Elecrow's own driver files, pulled from their [reference repo](https://github.com/Elecrow-RD/CrowPanel-ESP32-2.13-E-paper-HMI-Display-with-122-250) and bundled directly in the sketch folder (Arduino compiles any `.cpp`/`.h` sitting next to the `.ino`, so no separate library install is needed). No license file is published in Elecrow's repo; it's vendor example code distributed for use with their hardware.
+Uses Heltec's own `HT_lCMEN2R13EFC1`/`HT_E0213A367` driver classes (bundled from their Arduino library, trimmed down in `hardware-research/heltec-e213/heltec-esp32-lib-trimmed` to just the files this sketch actually needs — the full library pulls in unrelated display drivers with dependencies that aren't installed).
 
-GPIO7 must be driven high before the panel will draw anything — it's the screen's power-enable pin. Easy to miss; it's not called out in the product's onboarding docs, only in the example sketches.
-
-Page turns run a full white-fill-and-clear cycle only once at boot (or after waking from sleep); every other page draw is a partial update kept ghost-free by re-syncing the panel's "previous frame" register (`EPD_SyncOldData`) after each draw, instead of re-flashing the whole screen on every turn.
+Every render is currently a full-screen refresh — Heltec's library only exposes true partial/windowed refresh via low-level single-character calls that would need to be driven directly instead of through the normal buffer+`drawString` API. Worth revisiting once this feels slow in practice.
 
 ## Storage
 
-The board has 8MB of flash, but Arduino's stock "8M with spiffs" partition scheme only gives LittleFS 1.5MB of it (reserving 3MB for the app, when this firmware compiles to about 1MB). `firmware/TinyEReader/partitions.csv` is a custom table that gives the app 1.5MB (still comfortable headroom) and LittleFS the remaining ~6.3MB. Building/flashing with `PartitionScheme=custom` in the FQBN picks this file up automatically — that's what `tools/build-firmware.ps1` and the commands below use.
-
-Changing the partition table changes where LittleFS's data physically lives on the flash chip, so **flashing this firmware onto a board that was previously running a different partition scheme will wipe any books already uploaded** — LittleFS won't recognize the old data at the new offsets and reformats automatically. That only happens once, the first time you flash the new table.
+The board has 16MB of flash. `firmware/HeltecVisionMasterE213/partitions.csv` gives the app 2MB and LittleFS the remaining ~13.9MB. Building/flashing with `PartitionScheme=custom` in the FQBN picks this file up automatically.
 
 ## Chapters and the EPUB converter
 
-Plain `.txt` has no concept of chapters, so the firmware looks for a form-feed byte (`0x0C`, `'\f'`) in the book to mark chapter boundaries — invisible in the rendered text, just a jump point for the dial while reading. A hand-typed `.txt` with no form feeds just has one implicit chapter.
+Plain `.txt` has no concept of chapters, so the firmware looks for a form-feed byte (`0x0C`, `'\f'`) in the book to mark chapter boundaries — invisible in the rendered text, just a jump point for the buttons while reading. A hand-typed `.txt` with no form feeds just has one implicit chapter.
 
 `tools/epub_to_txt.py` converts an EPUB to a `.txt` with these markers already inserted, using the book's real chapter headings (`<h1>`/`<h2>`/`<h3>`) when present, or one marker per internal chapter file as a fallback:
 
@@ -67,63 +55,39 @@ Plain `.txt` has no concept of chapters, so the firmware looks for a form-feed b
 py tools\epub_to_txt.py yourbook.epub
 ```
 
-Writes `yourbook.txt` next to it — upload that the normal way. Real-world EPUBs vary a lot in how publishers structure their markup, so double-check the first book you convert; if the chapters land in odd places, note which book and it's worth revisiting the detection heuristic.
-
-## Icons and QR codes
-
-`EPD_ShowPicture()` (the vendor driver's bitmap function) takes a 1-bit image packed MSB-first, row-major, with each row padded to a whole byte — not a format any normal image tool exports. `tools/image_to_epd.py` converts a PNG (or the base64 PNG embedded in a `.piskel` file, so hand-drawn icons from [Piskel](https://www.piskelapp.com/) can be used directly with no separate export step) into that format as a ready-to-paste C array:
-
-```powershell
-py tools\image_to_epd.py icon.piskel --name iconName --out firmware\TinyEReader\generated\icon_name.h
-py tools\image_to_epd.py qr.png --name qrName --size 80 --out firmware\TinyEReader\generated\qr_name.h
-```
-
-`--size` resizes to an NxN square using PIL's BOX filter (averages each target pixel over its source region — held up in testing better than nearest-neighbor for QR codes, where a single bad sample can flip a module and break the scan). For a new QR code, verify it still decodes at your target size *from the actual packed bytes*, not just the source image, before wiring it in — a corrupted pack step or a size that's too small can silently produce an unscannable code that still "looks right" in a raw preview.
+Writes `yourbook.txt` next to it — upload that the normal way.
 
 ## Building
 
-Requires the Arduino IDE (for its bundled `arduino-cli`) — no manual library installs needed, since the only dependency (the EPD driver) lives in the sketch folder.
+Requires the Arduino IDE (for its bundled `arduino-cli`) plus the trimmed Heltec library already checked into `hardware-research/heltec-e213/heltec-esp32-lib-trimmed`.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\build-firmware.ps1
+$cli = "$env:LOCALAPPDATA\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
+& $cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=custom,CDCOnBoot=cdc" --library hardware-research\heltec-e213\heltec-esp32-lib-trimmed --output-dir firmware\HeltecVisionMasterE213\build firmware\HeltecVisionMasterE213
 ```
-
-This installs the ESP32 board core on first run, compiles `firmware/TinyEReader`, and copies the merged binary to `tools/web-flasher/firmware/tiny-ereader-merged.bin`.
-
-(If double-clicking `.ps1` files or running them directly gives a "running scripts is disabled" error, that's Windows' default PowerShell execution policy — the `-ExecutionPolicy Bypass` flag above sidesteps it for just this one run, without changing your system policy.)
 
 ### Board settings (if building from the Arduino IDE instead)
 
 - Board: **ESP32S3 Dev Module**
-- Flash Size: **8MB**
-- Partition Scheme: **Custom** (picks up `firmware/TinyEReader/partitions.csv`)
+- Flash Size: **16MB**
+- Partition Scheme: **Custom** (picks up `firmware/HeltecVisionMasterE213/partitions.csv`)
 - PSRAM: **OPI PSRAM**
 - USB CDC On Boot: **Enabled**
 
 ## Flashing
 
-**Option 1 — direct USB upload (fastest):**
-
 ```powershell
 $cli = "$env:LOCALAPPDATA\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
-& $cli upload -p COMx --fqbn "esp32:esp32:esp32s3:FlashSize=8M,PSRAM=opi,PartitionScheme=custom,CDCOnBoot=cdc" --input-dir firmware\TinyEReader\build firmware\TinyEReader
+& $cli upload -p COMx --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=custom,CDCOnBoot=cdc" --input-dir firmware\HeltecVisionMasterE213\build firmware\HeltecVisionMasterE213
 ```
 
-Replace `COMx` with the board's port (check Device Manager). If it doesn't connect, hold **BOOT**, tap **RESET**, then release **BOOT** and retry.
-
-**Option 2 — browser flasher (no Arduino IDE needed on the flashing machine):**
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\start-web-flasher.ps1
-```
-
-Then open `http://localhost:8787` in Chrome or Edge (Web Serial requires a Chromium browser), click **Connect and Flash**, and pick the board's serial port.
+Replace `COMx` with the board's port (check Device Manager).
 
 ## Using it
 
 1. Flash the firmware.
-2. On the device, press the dial to open the Home menu, move to **Connect to Wi-Fi** with the dial, and press the dial to select it.
-3. Scan the Wi-Fi QR code with your phone (or connect manually to `PocketReader`, password `12345678`).
-4. Open `http://192.168.4.1` and upload a `.txt` file (or a converted EPUB — see [Chapters](#chapters-and-the-epub-converter)). It becomes the active book immediately.
-5. Press the dial (or tap Top) to back out of the Wi-Fi screen when done — Wi-Fi turns off automatically.
-6. Use Top/Bottom to turn pages (hold to keep going), the dial to skip chapters, dial press for the Home menu.
+2. On the device, hold both buttons to open the Home menu, tap either button to move to **Connect to Wi-Fi**, hold Right to select it.
+3. Connect to `PocketReader`, password `12345678`.
+4. Open `http://192.168.4.1` and upload one or more `.txt` files (or converted EPUBs — see [Chapters](#chapters-and-the-epub-converter)). Uploading doesn't open a book automatically — pick one from the device's Choose Book screen.
+5. Hold Right (or Both) to back out of the Wi-Fi screen when done — Wi-Fi turns off automatically.
+6. Tap Left/Right to turn pages, hold either to jump chapters, hold both for the Home menu.
