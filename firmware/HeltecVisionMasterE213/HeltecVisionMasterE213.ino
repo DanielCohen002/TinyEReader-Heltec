@@ -34,11 +34,9 @@
   confirmed on real hardware; this was backwards in the initial guess):
 
   Reading a book:
-    Left tap        -> previous page      Right tap        -> next page
-    Left double-tap  -> previous chapter   Right double-tap  -> next chapter
-    Left hold        -> keep paging back   Right hold        -> keep paging forward
-                         (auto-repeats, like the CrowPanel build's Top/Bottom hold)
-    Both held        -> Home menu
+    Left tap    -> previous page       Right tap    -> next page
+    Left hold   -> previous chapter    Right hold   -> next chapter
+    Both held   -> Home menu
 
   Everywhere else (Home / Choose Book / Wi-Fi / delete dialog):
     Left tap    -> move selection      Right tap    -> move selection
@@ -46,11 +44,11 @@
     Right hold  -> select / confirm
     Both held   -> Home menu (also cancels the delete dialog without deleting)
 
-  A tap only fires once its own double-tap window passes without a second
-  tap following -- see DOUBLE_TAP_WINDOW_MS -- so every single tap has a
-  small (currently 250ms) built-in delay before the page turns. Worth
-  shortening if that lag is more annoying in practice than double-tap
-  chapter-skipping is useful.
+  (A double-tap-for-chapter-skip / hold-to-keep-paging scheme was tried
+  and reverted -- see git history -- it interacted badly with the screen
+  refresh blocking the input loop for as long as the panel takes to
+  redraw, causing a real double-tap to sometimes just fire as two
+  separate delayed single taps instead of a chapter skip.)
 
   Both-held ("double push") is intentionally forgiving about how
   simultaneously the two buttons actually go down -- see the comment on
@@ -130,8 +128,6 @@ constexpr uint8_t MAX_BOOKS = 64;
 constexpr uint8_t CHOOSE_VISIBLE_ROWS = 6;  // one row is a free-space header, see renderChooseBook()
 
 constexpr unsigned long HOLD_THRESHOLD_MS = 500;  // tap vs. hold cutoff for both buttons
-constexpr unsigned long PAGE_REPEAT_DELAY_MS = 500;     // hold Left/Right this long to start auto-paging (reading screen only)
-constexpr unsigned long PAGE_REPEAT_INTERVAL_MS = 300;  // then advance one page this often while held
 
 // Reading screen layout. Uses ArialMT_Plain_16 for readable text, but at
 // 7 lines/page rather than the font's own 19px line height (which only
@@ -477,6 +473,10 @@ const char uploadPage[] PROGMEM = R"rawliteral(
 // ---------------- DISPLAY ----------------
 ScreenDisplay *display;
 bool displayNeedsReinit = true;
+// Set by probeAndCreateDisplay() once the actual chip variant is known --
+// only HT_ICMEN2R13EFC1 implements dis_img_Partial_Refresh(); the untested
+// HT_E0213A367 fallback leaves this false and always gets a full renderHome().
+bool displaySupportsPartialRefresh = false;
 
 void VextON(void) {
   pinMode(VEXT_CTRL_1, OUTPUT);
@@ -537,12 +537,18 @@ void probeAndCreateDisplay() {
   }
   digitalWrite(PIN_EINK_CS, HIGH);
 
+  Serial.printf("[display] chipId=0x%02X -> %s\n", chipId,
+                ((chipId & 0x03) != 0x01) ? "HT_ICMEN2R13EFC1 (partial refresh supported)"
+                                           : "HT_E0213A367 (no partial refresh)");
+
   if ((chipId & 0x03) != 0x01) {
     display = new HT_ICMEN2R13EFC1(PIN_EINK_RST, PIN_EINK_DC, PIN_EINK_CS, PIN_EINK_BUSY,
                                     PIN_EINK_SCLK, PIN_EINK_MOSI, -1, 6000000);
+    displaySupportsPartialRefresh = true;
   } else {
     display = new HT_E0213A367(PIN_EINK_RST, PIN_EINK_DC, PIN_EINK_CS, PIN_EINK_BUSY,
                                 PIN_EINK_SCLK, PIN_EINK_MOSI, -1, 6000000);
+    displaySupportsPartialRefresh = false;  // dis_img_Partial_Refresh() isn't implemented on this variant
   }
 }
 
@@ -1164,15 +1170,73 @@ void renderHome() {
     }
   }
 
-  // Only Right-hold does anything on this screen (selects the highlighted
-  // item); both-hold is a no-op here since Home is already Home. Kept at
-  // the small font -- it's a static caption, not a navigable line, and
-  // there's no vertical room left for it at the bigger size anyway.
-  display->setFont(ArialMT_Plain_10);
-  display->drawString(4, 102, "Tap=Move  Hold Right=Select");
-
   display->update(BLACK_BUFFER);
   display->display();
+}
+
+// Moves the Home selection box without a full black-flash refresh -- redraws
+// just the old and new selection borders into the framebuffer, then pushes a
+// single small region covering both (and any gap between them, if the
+// selection jumped more than one icon over) via dis_img_Partial_Refresh.
+// Falls back to a full renderHome() on the untested HT_E0213A367 variant,
+// which doesn't implement dis_img_Partial_Refresh (see
+// displaySupportsPartialRefresh in probeAndCreateDisplay()). Shared by every
+// screen that moves a selection marker (see moveHomeSelection(),
+// moveChooseSelection(), toggleConfirmDelete()) -- callers draw the changed
+// pixels into the framebuffer first (setColor()/drawRect()/drawString()
+// etc.), then call this to push just that rectangle to the panel instead of
+// display->update()+display->display() re-flashing the whole screen.
+void pushPartialRegion(uint16_t x, uint16_t yTop, uint16_t yBottom, uint16_t w) {
+  // dis_img_Partial_Refresh addresses rows in whole 8-pixel pages (see its
+  // definition in HT_lCMEN2R13EFC1.h) -- round the pixel span out to the
+  // enclosing page boundaries so no changed row gets clipped.
+  uint16_t pageStart = yTop / 8;
+  uint16_t pageCount = (yBottom + 7) / 8 - pageStart;
+
+  static unsigned char region[SCREEN_W * 16];  // worst case: full-width span, all pages
+  uint16_t pcnt = 0;
+  for (uint16_t col = 0; col < w; col++) {
+    for (uint16_t page = 0; page < pageCount; page++) {
+      // dis_img_Partial_Refresh's own write path doesn't invert like the
+      // normal full-frame update()'s addr-0x13 path does -- apply the same
+      // ~ here so BLACK/WHITE polarity matches what the panel expects.
+      region[pcnt++] = ~display->buffer[(x + col) + (pageStart + page) * SCREEN_W];
+    }
+  }
+  display->dis_img_Partial_Refresh(x, pageStart * 8, w, pageCount, region);
+}
+
+void moveHomeSelection(uint8_t newSelection) {
+  ensureDisplayAwake();
+  if (!displaySupportsPartialRefresh) {
+    Serial.println("[home] partial refresh unsupported on this chip, doing full renderHome()");
+    homeSelection = newSelection;
+    renderHome();
+    return;
+  }
+  Serial.println("[home] using dis_img_Partial_Refresh");
+
+  uint8_t oldSelection = homeSelection;
+  homeSelection = newSelection;
+
+  constexpr uint16_t BOX_W = HOME_ICON_SIZE + 8;
+  constexpr uint16_t BOX_TOP = HOME_ICON_Y - 4;
+  constexpr uint16_t BOX_BOTTOM = HOME_LABEL_Y + HOME_LABEL_FONT_SIZE + 2;
+  constexpr uint16_t BOX_H = BOX_BOTTOM - BOX_TOP;
+
+  // BLACK clears a bit to 0 (background/blank), WHITE sets it to 1
+  // (foreground/ink) -- matches clear()'s zero-fill and every draw call
+  // elsewhere in this file, none of which set a color explicitly and so
+  // rely on the WHITE default to paint ink. Erase the old border with
+  // BLACK, then draw the new one with WHITE.
+  display->setColor(BLACK);
+  display->drawRect(HOME_ICON_X[oldSelection] - 4, BOX_TOP, BOX_W, BOX_H);
+  display->setColor(WHITE);
+  display->drawRect(HOME_ICON_X[newSelection] - 4, BOX_TOP, BOX_W, BOX_H);
+
+  uint16_t left = min(HOME_ICON_X[oldSelection], HOME_ICON_X[newSelection]) - 4;
+  uint16_t right = max(HOME_ICON_X[oldSelection], HOME_ICON_X[newSelection]) - 4 + BOX_W;
+  pushPartialRegion(left, BOX_TOP, BOX_BOTTOM, right - left);
 }
 
 // Keeps chooseSelection inside [chooseWindowStart, chooseWindowStart +
@@ -1222,6 +1286,47 @@ void renderChooseBook() {
   display->display();
 }
 
+// Row-cursor analogue of moveHomeSelection() -- redraws just the old and
+// new selection rows and partial-refreshes that strip instead of the whole
+// screen. Falls back to a full renderChooseBook() whenever the selection
+// moves outside the current scroll window, since scrolling changes every
+// visible row, not just two.
+void moveChooseSelection(uint8_t newSelection) {
+  ensureDisplayAwake();
+  uint8_t oldSelection = chooseSelection;
+  bool oldVisible = (oldSelection >= chooseWindowStart) && (oldSelection < chooseWindowStart + CHOOSE_VISIBLE_ROWS);
+  bool newVisible = (newSelection >= chooseWindowStart) && (newSelection < chooseWindowStart + CHOOSE_VISIBLE_ROWS);
+
+  chooseSelection = newSelection;
+
+  if (!displaySupportsPartialRefresh || !oldVisible || !newVisible) {
+    scrollChooseWindow();
+    renderChooseBook();
+    return;
+  }
+
+  display->setFont(ArialMT_Plain_16);
+  display->setTextAlignment(TEXT_ALIGN_LEFT);
+
+  uint8_t changed[2] = { oldSelection, newSelection };
+  for (uint8_t c = 0; c < 2; c++) {
+    uint8_t row = changed[c] - chooseWindowStart;
+    uint16_t y = 2 + (row + 1) * MENU_LINE_HEIGHT;
+    display->setColor(BLACK);
+    display->fillRect(0, y, SCREEN_W, MENU_LINE_HEIGHT);
+    display->setColor(WHITE);
+    String label = (changed[c] == chooseSelection) ? "> " : "  ";
+    label += truncateToWidth(bookList[changed[c]], BOOK_USABLE_WIDTH - display->getStringWidth(label));
+    display->drawString(MENU_LEFT_MARGIN, y, label);
+  }
+
+  uint8_t rowOld = oldSelection - chooseWindowStart;
+  uint8_t rowNew = newSelection - chooseWindowStart;
+  uint16_t top = 2 + (min(rowOld, rowNew) + 1) * MENU_LINE_HEIGHT;
+  uint16_t bottom = top + (max(rowOld, rowNew) - min(rowOld, rowNew) + 1) * MENU_LINE_HEIGHT;
+  pushPartialRegion(0, top, bottom, SCREEN_W);
+}
+
 void renderConfirmDelete() {
   ensureDisplayAwake();
   display->setFont(ArialMT_Plain_16);
@@ -1240,6 +1345,32 @@ void renderConfirmDelete() {
 
   display->update(BLACK_BUFFER);
   display->display();
+}
+
+// Yes/No cursor analogue of moveHomeSelection() -- both labels sit on
+// fixed, always-visible rows, so unlike moveChooseSelection() there's no
+// scroll-window case to fall back from.
+void toggleConfirmDelete() {
+  ensureDisplayAwake();
+  confirmDeleteYes = !confirmDeleteYes;
+
+  if (!displaySupportsPartialRefresh) {
+    renderConfirmDelete();
+    return;
+  }
+
+  display->setFont(ArialMT_Plain_16);
+  display->setTextAlignment(TEXT_ALIGN_LEFT);
+
+  uint16_t yesY = 2 + 3 * MENU_LINE_HEIGHT;
+  uint16_t noY = 2 + 4 * MENU_LINE_HEIGHT;
+  display->setColor(BLACK);
+  display->fillRect(0, yesY, SCREEN_W, 2 * MENU_LINE_HEIGHT);
+  display->setColor(WHITE);
+  display->drawString(MENU_LEFT_MARGIN, yesY, confirmDeleteYes ? "> Yes" : "  Yes");
+  display->drawString(MENU_LEFT_MARGIN, noY, !confirmDeleteYes ? "> No" : "  No");
+
+  pushPartialRegion(0, yesY, noY + MENU_LINE_HEIGHT, SCREEN_W);
 }
 
 void renderWifiInfo() {
@@ -1429,20 +1560,26 @@ ButtonGesture pollButtons() {
   return gesture;
 }
 
-// Handles every screen except SCREEN_READING, which has its own gesture
-// vocabulary (double-tap, hold-to-repeat) driven by handleReadingButtons()
-// below instead of this plain tap/hold/both-hold dispatch.
 void dispatchGesture(ButtonGesture gesture) {
   switch (currentScreen) {
+    case SCREEN_READING:
+      switch (gesture) {
+        case GESTURE_LEFT_TAP: previousPage(); break;
+        case GESTURE_LEFT_HOLD: previousChapter(); break;
+        case GESTURE_RIGHT_TAP: nextPage(); break;
+        case GESTURE_RIGHT_HOLD: nextChapter(); break;
+        case GESTURE_BOTH_HOLD: enterHome(); break;
+        default: break;
+      }
+      break;
+
     case SCREEN_HOME:
       switch (gesture) {
         case GESTURE_LEFT_TAP:
-          homeSelection = (homeSelection + HOME_ITEM_COUNT - 1) % HOME_ITEM_COUNT;
-          renderHome();
+          moveHomeSelection((homeSelection + HOME_ITEM_COUNT - 1) % HOME_ITEM_COUNT);
           break;
         case GESTURE_RIGHT_TAP:
-          homeSelection = (homeSelection + 1) % HOME_ITEM_COUNT;
-          renderHome();
+          moveHomeSelection((homeSelection + 1) % HOME_ITEM_COUNT);
           break;
         case GESTURE_RIGHT_HOLD: selectHomeItem(); break;
         case GESTURE_BOTH_HOLD: enterHome(); break;
@@ -1454,14 +1591,10 @@ void dispatchGesture(ButtonGesture gesture) {
       if (bookCount > 0) {
         switch (gesture) {
           case GESTURE_LEFT_TAP:
-            chooseSelection = (chooseSelection + bookCount - 1) % bookCount;
-            scrollChooseWindow();
-            renderChooseBook();
+            moveChooseSelection((chooseSelection + bookCount - 1) % bookCount);
             break;
           case GESTURE_RIGHT_TAP:
-            chooseSelection = (chooseSelection + 1) % bookCount;
-            scrollChooseWindow();
-            renderChooseBook();
+            moveChooseSelection((chooseSelection + 1) % bookCount);
             break;
           case GESTURE_RIGHT_HOLD: openBook(bookList[chooseSelection]); break;
           case GESTURE_LEFT_HOLD: enterConfirmDelete(); break;
@@ -1482,8 +1615,7 @@ void dispatchGesture(ButtonGesture gesture) {
       switch (gesture) {
         case GESTURE_LEFT_TAP:
         case GESTURE_RIGHT_TAP:
-          confirmDeleteYes = !confirmDeleteYes;
-          renderConfirmDelete();
+          toggleConfirmDelete();
           break;
         case GESTURE_RIGHT_HOLD:
           currentScreen = SCREEN_CHOOSE_BOOK;
@@ -1504,98 +1636,8 @@ void dispatchGesture(ButtonGesture gesture) {
   }
 }
 
-constexpr unsigned long DOUBLE_TAP_WINDOW_MS = 250;  // see file header for the latency tradeoff this implies
-
-// Reading screen only: a tap only fires (page turn) once DOUBLE_TAP_WINDOW_MS
-// passes without a second tap on the same button following it, in which
-// case that pair fires a chapter skip instead. Left/Right-hold from
-// pollButtons() are ignored here (their single-fire nature doesn't suit
-// "keep paging while held") in favor of directly polling the raw pin state
-// below for continuous auto-repeat, the same way the CrowPanel build's
-// Top/Bottom hold-to-repeat works.
-void handleReadingButtons(ButtonGesture gesture) {
-  static bool leftTapPending = false, rightTapPending = false;
-  static unsigned long leftTapTime = 0, rightTapTime = 0;
-  unsigned long now = millis();
-
-  if (leftTapPending && now - leftTapTime >= DOUBLE_TAP_WINDOW_MS) {
-    leftTapPending = false;
-    previousPage();
-  }
-  if (rightTapPending && now - rightTapTime >= DOUBLE_TAP_WINDOW_MS) {
-    rightTapPending = false;
-    nextPage();
-  }
-
-  static unsigned long leftHoldStart = 0, leftLastRepeat = 0;
-  static unsigned long rightHoldStart = 0, rightLastRepeat = 0;
-  static bool wasLeftDown = false, wasRightDown = false;
-  bool nowLeftDown = pressed(BTN_LEFT);
-  bool nowRightDown = pressed(BTN_RIGHT);
-
-  if (nowLeftDown && !wasLeftDown) { leftHoldStart = now; leftLastRepeat = now; }
-  if (nowRightDown && !wasRightDown) { rightHoldStart = now; rightLastRepeat = now; }
-
-  // Suppressed while both are down so a both-held-for-Home attempt doesn't
-  // also spray page turns while the user is getting both fingers on.
-  if (!(nowLeftDown && nowRightDown)) {
-    if (nowLeftDown && now - leftHoldStart >= PAGE_REPEAT_DELAY_MS &&
-        now - leftLastRepeat >= PAGE_REPEAT_INTERVAL_MS) {
-      leftLastRepeat = now;
-      touchActivity();
-      previousPage();
-    }
-    if (nowRightDown && now - rightHoldStart >= PAGE_REPEAT_DELAY_MS &&
-        now - rightLastRepeat >= PAGE_REPEAT_INTERVAL_MS) {
-      rightLastRepeat = now;
-      touchActivity();
-      nextPage();
-    }
-  }
-
-  wasLeftDown = nowLeftDown;
-  wasRightDown = nowRightDown;
-
-  switch (gesture) {
-    case GESTURE_LEFT_TAP:
-      if (leftTapPending) {
-        leftTapPending = false;
-        touchActivity();
-        previousChapter();
-      } else {
-        leftTapPending = true;
-        leftTapTime = now;
-      }
-      break;
-    case GESTURE_RIGHT_TAP:
-      if (rightTapPending) {
-        rightTapPending = false;
-        touchActivity();
-        nextChapter();
-      } else {
-        rightTapPending = true;
-        rightTapTime = now;
-      }
-      break;
-    case GESTURE_BOTH_HOLD:
-      touchActivity();
-      enterHome();
-      break;
-    default: break;  // LEFT_HOLD/RIGHT_HOLD: repeat is handled above instead
-  }
-}
-
 void handleButtons() {
   ButtonGesture gesture = pollButtons();
-
-  // The reading screen needs to run its repeat/double-tap timing checks
-  // every tick, not just when a new gesture fires, so it's dispatched
-  // unconditionally instead of gated behind gesture != GESTURE_NONE below.
-  if (currentScreen == SCREEN_READING) {
-    handleReadingButtons(gesture);
-    return;
-  }
-
   if (gesture == GESTURE_NONE) return;
   touchActivity();
   dispatchGesture(gesture);

@@ -369,7 +369,7 @@ public:
 		sendData(x);
 		sendData(x + w - 1); // V End 32
 	}
-	void dis_img_Partial_Refresh(uint8_t x, uint8_t y, uint8_t w, uint8_t h, const unsigned char *img)
+	void dis_img_Partial_Refresh(uint8_t x, uint8_t y, uint8_t w, uint8_t h, const unsigned char *img) override
 	{
 		unsigned int row, col;
 		unsigned int pcnt;

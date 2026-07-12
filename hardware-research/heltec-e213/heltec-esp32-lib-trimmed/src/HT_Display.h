@@ -248,6 +248,13 @@ class ScreenDisplay : public Print  {
 
     // Write the buffer to the display memory
     virtual void display(void) = 0;
+    // Fast refresh of a small sub-rectangle -- only implemented on chip
+    // variants that support it (see HT_ICMEN2R13EFC1::dis_img_Partial_Refresh(),
+    // ported from Heltec's own Part_Simple.ino example). No-op default so
+    // callers on an unsupported variant just don't get the optimization;
+    // check a capability flag (see displaySupportsPartialRefresh in the
+    // sketch) rather than relying on this having any visible effect.
+    virtual void dis_img_Partial_Refresh(uint8_t x, uint8_t y, uint8_t w, uint8_t h, const unsigned char *img) {}
     virtual void update(DISPLAY_BUFFER bufferType = BLACK_BUFFER)
     {
 
