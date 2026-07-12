@@ -6,6 +6,8 @@ Upload `.txt` books over Wi-Fi, read them on the e-paper screen, jump between ch
 
 **[Flash it from your browser](https://danielcohen002.github.io/TinyEReader-Heltec/)** — no Arduino IDE needed, just Chrome or Edge and a USB cable.
 
+> **Status: paused.** Development has moved to the [CrowPanel build](https://github.com/DanielCohen002/TinyEReader-CrowPanel) — it turned out to be the better board for this project overall, and that's the one with a battery sourced for it now. This repo works and is flashable, but isn't getting new features. The main known issue: every screen redraw is a full black-flash refresh (inherent to how this panel's e-paper driver works) — see [Display driver](#display-driver) below for what was tried and why it's unresolved.
+
 Built and compile-tested without physical access to the board at first (see `hardware-research/heltec-e213` for the schematic/datasheet/factory-test sources every pin number and API call is drawn from), now running on real hardware. Anything the code comments still mark "verify on hardware" or "a guess" is worth double-checking against your actual board.
 
 ## Features
@@ -14,7 +16,7 @@ Built and compile-tested without physical access to the board at first (see `har
 - Remembers your reading position per book; boots to the Home screen (not straight into reading)
 - True sequential page-up/page-down (always the actual neighboring page, computed by replaying pagination rather than an undo-last-jump stack)
 - Chapter skip, using a marker character a book can contain — see [Chapters](#chapters-and-the-epub-converter) below
-- Icon-based Home screen (Resume Last Book / Choose Book / Connect to Wi-Fi) with a button-hint line, matching the CrowPanel build's layout
+- Icon-based Home screen (Resume Last Book / Choose Book / Connect to Wi-Fi), matching the CrowPanel build's layout
 - Two QR codes on the Connect to Wi-Fi screen — one auto-joins the `PocketReader` network, one links to the upload page
 - Web upload page with drag-and-drop, multi-file queueing (pre-checked against free space so a book that won't fit is skipped instead of failing mid-batch), a live library list, and per-book delete
 - Wi-Fi only powers on while the Connect to Wi-Fi screen is open — off the rest of the time (including at boot) to save battery
@@ -33,12 +35,12 @@ Built and compile-tested without physical access to the board at first (see `har
 
 Only 2 real buttons exist: **Left** = GPIO21/USER, **Right** = GPIO0/BOOT — confirmed on real hardware.
 
-| | Left tap | Left double-tap | Left hold | Right tap | Right double-tap | Right hold | Both held |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Reading a book | Previous page | Previous chapter | Keep paging back (auto-repeats) | Next page | Next chapter | Keep paging forward (auto-repeats) | Home menu |
-| Home / Choose Book / Wi-Fi / delete dialog | Move selection | — | Open delete dialog (Choose Book only) | Move selection | — | Select / confirm | Home menu (also cancels delete without deleting) |
+| | Left tap | Left hold | Right tap | Right hold | Both held |
+| --- | --- | --- | --- | --- | --- |
+| Reading a book | Previous page | Previous chapter | Next page | Next chapter | Home menu |
+| Home / Choose Book / Wi-Fi / delete dialog | Move selection | Open delete dialog (Choose Book only) | Move selection | Select / confirm | Home menu (also cancels delete without deleting) |
 
-A tap only fires once a short window (250ms, `DOUBLE_TAP_WINDOW_MS`) passes without a second tap on the same button following it — that's what makes double-tap possible, at the cost of a small delay on every single page turn. Both-held is deliberately forgiving about how simultaneously the two buttons actually go down (see `BOTH_HOLD_STAGGER_GRACE_MS` in `pollButtons()`), since two physical buttons are rarely pressed within the same tens of milliseconds of each other.
+A double-tap-for-chapter-skip / hold-to-keep-paging scheme was tried and reverted — it interacted badly with the screen refresh blocking the input loop for as long as the panel takes to redraw, causing a real double-tap to sometimes just fire as two separate delayed single taps instead of a chapter skip. Both-held is deliberately forgiving about how simultaneously the two buttons actually go down (see `BOTH_HOLD_STAGGER_GRACE_MS` in `pollButtons()`), since two physical buttons are rarely pressed within the same tens of milliseconds of each other.
 
 Button state is tracked via GPIO interrupts (`onLeftChange`/`onRightChange`), not plain polling — a full-screen refresh blocks `loop()` for as long as the panel takes to redraw (e-paper is physically slow, ~1-2s), long enough for a quick tap's entire press-and-release to happen while nothing is polling the pins. A plain `digitalRead()` poll loop would see no edge at all when it resumes and silently drop that tap; `pollButtons()` recovers it from the interrupt-recorded timestamps instead.
 
@@ -46,7 +48,10 @@ Button state is tracked via GPIO interrupts (`onLeftChange`/`onRightChange`), no
 
 Uses Heltec's own `HT_lCMEN2R13EFC1`/`HT_E0213A367` driver classes (bundled from their Arduino library, trimmed down in `hardware-research/heltec-e213/heltec-esp32-lib-trimmed` to just the files this sketch actually needs — the full library pulls in unrelated display drivers with dependencies that aren't installed).
 
-Every render is a full black-flash refresh. A genuine partial/fast refresh was attempted (adapted from the vendor library's own `dis_img_Partial_Refresh()` example), including chasing down a real bug in its window parameters, but it didn't visibly help even after the fix — see git history if it's worth another look with actual hardware-debugging tools, since guessing further at undocumented LUT/waveform behavior with no way to see the panel wasn't productive.
+Every render is a full black-flash refresh. Two rounds of attempting a genuine partial/fast refresh (adapted from the vendor library's own `dis_img_Partial_Refresh()` example) haven't visibly fixed it:
+
+1. A first attempt applied it to the whole 250×122 screen. Heltec's own official example (`Part_Simple.ino`) only ever uses it on a small region (a 14×32px digit) — applying it full-screen was outside what's actually validated to work, which likely explains why it never reduced the flash. Reverted.
+2. A second attempt scoped it down correctly — used only to move the selection cursor on the Home/Choose Book/Confirm Delete screens (redrawing just the changed rows/box via `dis_img_Partial_Refresh()` instead of a full `renderX()` + `display()`), leaving full refresh in place for page turns and full-screen switches. This is still in the code (see `moveHomeSelection()`, `moveChooseSelection()`, `toggleConfirmDelete()`), but on real hardware it isn't showing a visible improvement either, and development paused before the root cause was tracked down. Worth another look with actual hardware-debugging tools (e.g. a camera on the panel plus the `Serial` diagnostics already added around `displaySupportsPartialRefresh`) if this repo gets picked back up.
 
 ## Storage
 
@@ -97,4 +102,4 @@ Replace `COMx` with the board's port (check Device Manager).
 3. Scan the Wi-Fi QR code with your phone (or connect manually to `PocketReader`, password `12345678`).
 4. Open `http://192.168.4.1` (or scan the Web QR code) and upload one or more `.txt` files (or converted EPUBs — see [Chapters](#chapters-and-the-epub-converter)). Uploading doesn't open a book automatically — pick one from the device's Choose Book screen.
 5. Hold Right to back out of the Wi-Fi screen when done — Wi-Fi turns off automatically.
-6. Tap Left/Right to turn pages, double-tap either to jump chapters, hold either to keep paging, hold both for the Home menu.
+6. Tap Left/Right to turn pages, hold either to jump chapters, hold both for the Home menu.
