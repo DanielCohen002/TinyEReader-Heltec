@@ -2,12 +2,11 @@
   Tiny E-Reader -- Heltec Vision Master E213 port
   ESP32-S3 + 2.13" e-paper (250x122), SX1262 LoRa radio present but unused.
 
-  This is a from-scratch port of the CrowPanel-based TinyEReader to
-  different hardware, built and compile-tested without physical access to
-  the board -- see hardware-research/heltec-e213 in this repo for the
-  schematic/datasheet/factory-test sources every pin number and API call
-  here is drawn from. Treat anything marked "verify on hardware" as an
-  educated guess pending real testing, not a confirmed fact.
+  Ported from the CrowPanel-based TinyEReader to different hardware -- see
+  hardware-research/heltec-e213 in this repo for the schematic/datasheet
+  sources every pin number and API call here is drawn from. Now running on
+  real hardware; anything still marked "verify on hardware" is an educated
+  guess pending further testing, not a confirmed fact.
 
   Key hardware differences from the CrowPanel build this was ported from:
   - Only 2 software-readable buttons exist (not the CrowPanel's 5 inputs).
@@ -15,20 +14,24 @@
     the chip's hardware EN pin, not a GPIO -- pressing it just restarts the
     chip from scratch, so software can't read it as a normal button. See
     the button scheme below.
-  - Real battery voltage sensing exists (GPIO7, ADC) -- the CrowPanel had
-    none at all.
+  - This board has a battery ADC pin (GPIO7) the CrowPanel doesn't, but the
+    percentage it produced didn't hold up in practice and was removed --
+    see the git history if it's worth revisiting with a better formula.
   - The display driver is Heltec's own library (proportional fonts, built-in
-    word-wrap) rather than Elecrow's fixed-width character blitter.
-  - This board ships with one of two possible e-paper controller chips
-    depending on manufacturing batch (same kind of ambiguity as the
-    CrowPanel's SSD1680/JD79661 situation) -- detected at runtime via a raw
-    SPI chip-ID probe, exactly as Heltec's own example does it.
+    word-wrap) rather than Elecrow's fixed-width character blitter. Per
+    Heltec's own board datasheet, the panel is always LCMEN2R13EFC1 (the
+    HT_ICMEN2R13EFC1 driver class) -- the alternate HT_E0213A367 class the
+    chip-ID probe can also select is defensive/untested, kept only because
+    Heltec's own example code handles both.
+  - Both the CrowPanel and this board's charge-status LED are wired
+    straight to their charger chip's status pins, not to any ESP32 GPIO --
+    there's no way for firmware to read or control charging state on
+    either board.
   - 16MB flash (double the CrowPanel's 8MB), so the custom partition table
     here gives LittleFS roughly 13.9MB.
 
-  Button scheme (only 2 real buttons: Left=GPIO0/BOOT, Right=GPIO21/USER --
-  which physical side is actually "left" vs "right" is a guess without the
-  board in hand; swap the two #defines below if it's backwards):
+  Button scheme (only 2 real buttons: Left=GPIO21/USER, Right=GPIO0/BOOT --
+  confirmed on real hardware; this was backwards in the initial guess):
 
   Reading a book:
     Left tap    -> previous page       Right tap    -> next page
@@ -41,14 +44,16 @@
     Right hold  -> select / confirm
     Both held   -> Home menu (also cancels the delete dialog without deleting)
 
-  Refresh strategy: every render is a full-screen refresh. Heltec's display
-  library only exposes true partial/windowed refresh via low-level
-  single-character calls that would need to be driven directly instead of
-  through the normal buffer+drawString API -- reverse-engineering that
-  without hardware to validate against was a risk not worth taking for a
-  first port. Once real hardware is available and this feels slow, that's
-  the next thing to optimize (the CrowPanel build went through the same
-  full-refresh-first, partial-refresh-later progression).
+  Refresh strategy: the first render after waking/booting is a full
+  black-flash refresh (clears ghosting left over from before sleep); every
+  render after that uses HT_ICMEN2R13EFC1::partialDisplay() -- a fast
+  refresh adapted from the vendor library's own dis_img_Partial_Refresh()
+  example, wired up to read the normal drawString/drawXbm framebuffer
+  instead of a separately-supplied image array. See refreshDisplay() below
+  and partialDisplay()'s comment in the vendored driver file for exactly
+  what changed from the vendor's original. Unverified visually since I
+  can't see the panel -- if a partial-refreshed screen looks corrupted or
+  doesn't update some region, that's the first thing to suspect.
 */
 
 #include <Arduino.h>
@@ -57,6 +62,13 @@
 #include <LittleFS.h>
 #include "HT_lCMEN2R13EFC1.h"
 #include "HT_E0213A367.h"
+
+// 1-bit icon bitmaps for the Home screen, packed LSB-first for
+// ScreenDisplay::drawXbm() -- generated with tools/image_to_epd.py
+// --format xbm from hand-drawn Piskel files.
+#include "generated/icon_book.h"
+#include "generated/icon_bookshelf.h"
+#include "generated/icon_wifi.h"
 
 // ---------------- HARDWARE CONFIG ----------------
 // E-paper SPI pins, Vext (peripheral power) pins, and the battery ADC pin
@@ -73,13 +85,11 @@
 #define VEXT_CTRL_1  18
 #define VEXT_CTRL_2  46
 
-#define BATTERY_ADC_PIN 7
-
 // Only two software-readable buttons exist -- see the button scheme in the
-// file header. "Left"/"Right" is a guess at physical position; swap these
-// two values if it's backwards once you can see the board.
-#define BTN_LEFT   0   // BOOT
-#define BTN_RIGHT  21  // USER
+// file header. Confirmed backwards on real hardware from the initial guess,
+// so BOOT is actually the right-hand button and USER is the left-hand one.
+#define BTN_LEFT   21  // USER
+#define BTN_RIGHT  0   // BOOT
 
 // ---------------- APP CONFIG ----------------
 const char* AP_NAME = "PocketReader";
@@ -134,8 +144,19 @@ enum ButtonGesture : uint8_t {
 };
 
 constexpr uint8_t HOME_ITEM_COUNT = 3;
-const char* HOME_LABELS[HOME_ITEM_COUNT] = { "Resume Last Book", "Choose Book", "Connect to Wi-Fi" };
+const uint8_t* HOME_ICONS[HOME_ITEM_COUNT] = { iconBook, iconBookshelf, iconWifi };
+const char* HOME_SHORT_LABELS[HOME_ITEM_COUNT] = { "Read", "Books", "Wi-Fi" };
 uint8_t homeSelection = 0;
+
+// Icon-first layout: a row of three 48x48 icons with a small label under
+// each, centered as a block in the 250x122 screen, selection shown as a
+// border box rather than a "> " prefix (there's no list to prefix here) --
+// same layout as the CrowPanel build's Home screen.
+constexpr uint16_t HOME_ICON_SIZE = 48;
+constexpr uint16_t HOME_ICON_Y = 30;
+constexpr uint8_t HOME_LABEL_FONT_SIZE = 10;  // smallest available (ArialMT_Plain_10)
+constexpr uint16_t HOME_LABEL_Y = HOME_ICON_Y + HOME_ICON_SIZE + 4;
+const uint16_t HOME_ICON_X[HOME_ITEM_COUNT] = { 26, 100, 174 };  // evenly spaced, symmetric margins
 
 String bookList[MAX_BOOKS];
 uint8_t bookCount = 0;
@@ -425,6 +446,21 @@ const char uploadPage[] PROGMEM = R"rawliteral(
 // ---------------- DISPLAY ----------------
 ScreenDisplay *display;
 bool displayNeedsReinit = true;
+// Every render used to be a full black-flash refresh (see file header).
+// Now only the first render after a wake/init uses that (to clear any
+// ghosting left over from before sleep); every other render uses
+// partialDisplay() instead. Mirrors displayNeedsReinit/epdNeedsFullInit's
+// "once per wake" pattern.
+bool displayNeedsFullRefresh = true;
+
+void refreshDisplay() {
+  if (displayNeedsFullRefresh) {
+    display->display();
+    displayNeedsFullRefresh = false;
+  } else {
+    display->partialDisplay();
+  }
+}
 
 void VextON(void) {
   pinMode(VEXT_CTRL_1, OUTPUT);
@@ -504,6 +540,7 @@ void ensureDisplayAwake() {
   delay(100);
   display->init();
   displayNeedsReinit = false;
+  displayNeedsFullRefresh = true;
 }
 
 // ---------------- UTIL ----------------
@@ -530,28 +567,6 @@ String freeSpaceLabel() {
   return String(buf);
 }
 
-constexpr float BATTERY_ADC_RESOLUTION = 1.0f / 4096.0f;
-constexpr float BATTERY_ADC_REF_V = 3.3f;
-constexpr float BATTERY_DIVIDER_COEFFICIENT = 4.01f;  // from Heltec's own factory-test formula
-
-float readBatteryVoltage() {
-  analogReadResolution(12);
-  int raw = analogRead(BATTERY_ADC_PIN);
-  return raw * BATTERY_ADC_RESOLUTION * BATTERY_ADC_REF_V * BATTERY_DIVIDER_COEFFICIENT;
-}
-
-// Linear approximation of a LiPo's 3.3V (empty) - 4.2V (full) range. Real
-// LiPo discharge curves aren't linear, but without hardware to calibrate
-// against, this is a reasonable first pass -- worth revisiting once you can
-// compare the reported percentage against a real charge/discharge cycle.
-uint8_t batteryPercent() {
-  float v = readBatteryVoltage();
-  float pct = (v - 3.3f) / (4.2f - 3.3f) * 100.0f;
-  if (pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-  return (uint8_t)(pct + 0.5f);
-}
-
 void showMessage(const String& message) {
   ensureDisplayAwake();
   display->setFont(ArialMT_Plain_10);
@@ -569,7 +584,7 @@ void showMessage(const String& message) {
   }
 
   display->update(BLACK_BUFFER);
-  display->display();
+  refreshDisplay();
 }
 
 // ---------------- LIBRARY ----------------
@@ -1065,7 +1080,7 @@ void renderPageAt(uint32_t offset) {
     display->drawString(BOOK_LEFT_MARGIN, BOOK_TOP_MARGIN + i * BOOK_LINE_HEIGHT, lines[i]);
   }
   display->update(BLACK_BUFFER);
-  display->display();
+  refreshDisplay();
 
   savePosition();
   touchActivity();
@@ -1086,24 +1101,31 @@ void previousPage() {
 // ---------------- MENUS ----------------
 void renderHome() {
   ensureDisplayAwake();
-  display->setFont(ArialMT_Plain_16);
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
+  display->setFont(ArialMT_Plain_10);
 
-  constexpr uint16_t lineH = 22;
   for (uint8_t i = 0; i < HOME_ITEM_COUNT; i++) {
-    String label = (i == homeSelection) ? "> " : "  ";
-    label += HOME_LABELS[i];
-    display->drawString(4, 6 + i * lineH, label);
+    uint16_t x = HOME_ICON_X[i];
+    display->drawXbm(x, HOME_ICON_Y, HOME_ICON_SIZE, HOME_ICON_SIZE, HOME_ICONS[i]);
+
+    const char* label = HOME_SHORT_LABELS[i];
+    uint16_t labelWidth = display->getStringWidth(String(label));
+    uint16_t labelX = x + (HOME_ICON_SIZE - labelWidth) / 2;
+    display->drawString(labelX, HOME_LABEL_Y, label);
+
+    if (i == homeSelection) {
+      display->drawRect(x - 4, HOME_ICON_Y - 4, HOME_ICON_SIZE + 8,
+                         (HOME_LABEL_Y + HOME_LABEL_FONT_SIZE + 2) - (HOME_ICON_Y - 4));
+    }
   }
 
-  display->setFont(ArialMT_Plain_10);
-  char buf[24];
-  snprintf(buf, sizeof(buf), "Battery: %u%%", batteryPercent());
-  display->drawString(4, 6 + HOME_ITEM_COUNT * lineH + 6, buf);
+  // Only Right-hold does anything on this screen (selects the highlighted
+  // item); both-hold is a no-op here since Home is already Home.
+  display->drawString(4, 102, "Tap=Move  Hold Right=Select");
 
   display->update(BLACK_BUFFER);
-  display->display();
+  refreshDisplay();
 }
 
 // Keeps chooseSelection inside [chooseWindowStart, chooseWindowStart +
@@ -1152,7 +1174,7 @@ void renderChooseBook() {
   }
 
   display->update(BLACK_BUFFER);
-  display->display();
+  refreshDisplay();
 }
 
 void renderConfirmDelete() {
@@ -1172,7 +1194,7 @@ void renderConfirmDelete() {
   display->drawString(MENU_LEFT_MARGIN, 2 + 4 * MENU_LINE_HEIGHT, noLabel);
 
   display->update(BLACK_BUFFER);
-  display->display();
+  refreshDisplay();
 }
 
 void renderWifiInfo() {
@@ -1193,7 +1215,7 @@ void renderWifiInfo() {
   display->drawString(MENU_LEFT_MARGIN, 2 + 6 * MENU_LINE_HEIGHT, "(hold Right to go back)");
 
   display->update(BLACK_BUFFER);
-  display->display();
+  refreshDisplay();
 }
 
 void enterWifiInfo() {

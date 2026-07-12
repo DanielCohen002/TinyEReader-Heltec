@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Convert a PNG (or the base64 PNG embedded in a .piskel file) into a C byte
-array in the packed 1-bit format EPD_ShowPicture() expects: MSB-first,
-row-major, each row padded to a whole byte. A set bit is a foreground
-(drawn) pixel; a clear bit is background.
+Convert a PNG (or the base64 PNG embedded in a .piskel file) into a packed
+1-bit C byte array, row-major, each row padded to a whole byte. A set bit is
+a foreground (drawn) pixel; a clear bit is background. Two bit orders are
+supported via --format:
+  epd  (default) MSB-first, what EPD_ShowPicture() expects (CrowPanel).
+  xbm             LSB-first, what ScreenDisplay::drawXbm() expects (Heltec).
 
 Usage:
     python image_to_epd.py icon.png --name bookIcon
     python image_to_epd.py Book.piskel --name bookIcon
     python image_to_epd.py qr.png --name wifiQr --size 96
+    python image_to_epd.py icon.piskel --name bookIcon --format xbm
 
 For .piskel files, extracts the first layer's first frame. For any input,
 if --size isn't given, uses the image's native size (rounding down to a
@@ -66,7 +69,7 @@ def to_1bit(img, size=None, threshold=128, invert=False):
     return bitmap
 
 
-def pack_bits(bitmap):
+def pack_bits(bitmap, fmt="epd"):
     w, h = bitmap.size
     row_bytes = (w + 7) // 8
     out = bytearray(row_bytes * h)
@@ -74,7 +77,8 @@ def pack_bits(bitmap):
     for y in range(h):
         for x in range(w):
             if px[x, y]:
-                out[y * row_bytes + (x // 8)] |= 0x80 >> (x % 8)
+                bit = (1 << (x % 8)) if fmt == "xbm" else (0x80 >> (x % 8))
+                out[y * row_bytes + (x // 8)] |= bit
     return bytes(out), w, h
 
 
@@ -97,12 +101,14 @@ def main():
     parser.add_argument("--size", type=int, default=None, help="resize to NxN first (nearest-neighbor)")
     parser.add_argument("--threshold", type=int, default=128)
     parser.add_argument("--invert", action="store_true")
+    parser.add_argument("--format", choices=["epd", "xbm"], default="epd",
+                         help="epd = MSB-first (EPD_ShowPicture, CrowPanel); xbm = LSB-first (drawXbm, Heltec)")
     parser.add_argument("--out", default=None, help="write to this file instead of stdout")
     args = parser.parse_args()
 
     img = load_image(args.input)
     bitmap = to_1bit(img, size=args.size, threshold=args.threshold, invert=args.invert)
-    data, w, h = pack_bits(bitmap)
+    data, w, h = pack_bits(bitmap, fmt=args.format)
     code = format_c_array(args.name, data, w, h)
 
     if args.out:

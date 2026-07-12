@@ -208,6 +208,57 @@ public:
 		end();
 	}
 
+	// Fast/partial refresh: writes the current buffer[] (the same
+	// framebuffer drawString/drawXbm/clear() already fill) through the
+	// panel's alternate LUT loaded via WRITE_LUT_RED(), which updates the
+	// screen without display()'s full black-flash cycle. Adapted from
+	// dis_img_Partial_Refresh() below (a vendor-provided example) to source
+	// pixel data from buffer[] instead of a separately-supplied raw image
+	// array -- the column-major access order here matches updateData()'s
+	// own 0x13 write for this same buffer, and the 0x13 write it does is
+	// otherwise byte-for-byte identical to that function's, just for a
+	// full-screen window instead of an arbitrary sub-rectangle.
+	void partialDisplay() override
+	{
+		int xmax = this->width();
+		int ymax = this->height() >> 3;
+
+		sendCommand(0x91); // DTM1 Write / enter partial mode
+		WaitUntilIdle();
+		sendCommand(0x90); // set partial window
+		WaitUntilIdle();
+		setwin(0, 0, xmax, ymax * 8);
+		sendData(0x00);
+
+		sendCommand(0x13);
+		WaitUntilIdle();
+		digitalWrite(_cs, LOW);
+		fSPI.beginTransaction(SPISettings(6000000, LSBFIRST, SPI_MODE0));
+		for (int x = 0; x < xmax; x++)
+		{
+			for (int y = 0; y < ymax; y++)
+			{
+				fSPI.transfer(~buffer[x + y * xmax]);
+			}
+		}
+		fSPI.endTransaction();
+		digitalWrite(_cs, HIGH);
+
+		sendCommand(0x92); // partial out
+		WRITE_LUT_RED();
+
+		sendCommand(0xE0);
+		sendData(0x02);
+		sendCommand(0xE5);
+		sendData(0x75);
+
+		sendCommand(0x04); // Power ON
+		WaitUntilIdle();
+		sendCommand(0x12); // Display Refresh
+		WaitUntilIdle();
+		sendCommand(0x02); // Power OFF
+	}
+
 	void WRITE_LUT_RED()
 	{
 		unsigned int count;

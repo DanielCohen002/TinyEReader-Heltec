@@ -12,7 +12,7 @@ Built and compile-tested without physical access to the board at first (see `har
 - Remembers your reading position per book; boots to the Home screen (not straight into reading)
 - True sequential page-up/page-down (always the actual neighboring page, computed by replaying pagination rather than an undo-last-jump stack)
 - Chapter skip, using a marker character a book can contain — see [Chapters](#chapters-and-the-epub-converter) below
-- Real battery percentage on the Home screen, read from the board's own ADC
+- Icon-based Home screen (Resume Last Book / Choose Book / Connect to Wi-Fi) with a button-hint line, matching the CrowPanel build's layout
 - Web upload page with drag-and-drop, multi-file queueing (pre-checked against free space so a book that won't fit is skipped instead of failing mid-batch), a live library list, and per-book delete
 - Wi-Fi only powers on while the Connect to Wi-Fi screen is open — off the rest of the time (including at boot) to save battery
 - Light-sleeps the ESP32 and puts the e-paper panel to sleep after a minute of inactivity, wakes on any button press
@@ -20,7 +20,7 @@ Built and compile-tested without physical access to the board at first (see `har
 ## Hardware differences from the CrowPanel build
 
 - Only 2 software-readable buttons exist (not the CrowPanel's 5 inputs). The board has a 3rd physical button (Reset), but it's wired straight to the chip's hardware EN pin, not a GPIO — pressing it just restarts the chip, so software can't read it as a normal button.
-- Real battery voltage sensing exists (GPIO7, ADC) — the CrowPanel had none at all.
+- This board has a battery ADC pin (GPIO7) the CrowPanel doesn't, but the percentage it produced wasn't accurate in practice and was removed.
 - The display driver is Heltec's own library (proportional fonts, built-in word-wrap) rather than a fixed-width character blitter.
 - This board ships with one of two possible e-paper controller chips depending on manufacturing batch — detected at runtime via a raw SPI chip-ID probe, exactly as Heltec's own example does it.
 - 16MB flash (double the CrowPanel's 8MB), so the custom partition table here gives LittleFS roughly 13.9MB.
@@ -28,7 +28,7 @@ Built and compile-tested without physical access to the board at first (see `har
 
 ## Buttons
 
-Only 2 real buttons exist: **Left** = GPIO0/BOOT, **Right** = GPIO21/USER. Which physical side is actually "left" vs "right" was a guess made without the board in hand — swap the `BTN_LEFT`/`BTN_RIGHT` `#define`s near the top of the `.ino` if it's backwards on yours.
+Only 2 real buttons exist: **Left** = GPIO21/USER, **Right** = GPIO0/BOOT — confirmed on real hardware.
 
 | | Left tap | Left hold | Right tap | Right hold | Both held |
 | --- | --- | --- | --- | --- | --- |
@@ -39,7 +39,7 @@ Only 2 real buttons exist: **Left** = GPIO0/BOOT, **Right** = GPIO21/USER. Which
 
 Uses Heltec's own `HT_lCMEN2R13EFC1`/`HT_E0213A367` driver classes (bundled from their Arduino library, trimmed down in `hardware-research/heltec-e213/heltec-esp32-lib-trimmed` to just the files this sketch actually needs — the full library pulls in unrelated display drivers with dependencies that aren't installed).
 
-Every render is currently a full-screen refresh — Heltec's library only exposes true partial/windowed refresh via low-level single-character calls that would need to be driven directly instead of through the normal buffer+`drawString` API. Worth revisiting once this feels slow in practice.
+The first render after waking/booting is a full black-flash refresh (clears ghosting); every render after that uses a fast partial refresh instead, adapted from the vendor library's own `dis_img_Partial_Refresh()` example (see `partialDisplay()` in `hardware-research/heltec-e213/heltec-esp32-lib-trimmed/src/HT_lCMEN2R13EFC1.h`) so it reads the normal `drawString`/`drawXbm` framebuffer instead of requiring a separately-supplied image array.
 
 ## Storage
 
