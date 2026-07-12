@@ -252,14 +252,6 @@ class ScreenDisplay : public Print  {
     {
 
     }
-    // Fast/partial refresh, skipping the full black-flash cycle plain
-    // display() does -- only implemented on chip variants that support it
-    // (see HT_ICMEN2R13EFC1::partialDisplay()). Falls back to a full
-    // display() on any variant that doesn't override this.
-    virtual void partialDisplay()
-    {
-      display();
-    }
     // Clear the local pixel buffer
     void clear(void);
 

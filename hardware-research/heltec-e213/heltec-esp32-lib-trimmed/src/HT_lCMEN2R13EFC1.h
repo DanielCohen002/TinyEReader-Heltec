@@ -208,63 +208,6 @@ public:
 		end();
 	}
 
-	// Fast/partial refresh: writes the current buffer[] (the same
-	// framebuffer drawString/drawXbm/clear() already fill) through the
-	// panel's alternate LUT loaded via WRITE_LUT_RED(), which updates the
-	// screen without display()'s full black-flash cycle. Adapted from
-	// dis_image() below (a vendor-provided full-screen example) to source
-	// pixel data from buffer[] instead of a hardcoded 0xFF fill -- the
-	// window bytes (0,128,0,250,0x01) and 16-row-per-column loop bound are
-	// copied verbatim from that function rather than computed from
-	// width()/height(), since dis_img_Partial_Refresh()'s general setwin()
-	// formula turned out not to match dis_image()'s own full-screen values
-	// (128 vs a computed 120, and a trailing 0x01 vs 0x00) -- whichever of
-	// those two conventions is "correct" isn't otherwise documented, so this
-	// follows the vendor's own working full-screen case specifically.
-	void partialDisplay() override
-	{
-		int xmax = this->width();
-		constexpr int rowsPerColumn = 16;  // matches dis_image()'s own loop, not height()>>3
-
-		sendCommand(0x91); // DTM1 Write / enter partial mode
-		WaitUntilIdle();
-		sendCommand(0x90); // set partial window
-		WaitUntilIdle();
-		sendData(0);
-		sendData(128);
-		sendData(0);
-		sendData(250);
-		sendData(0x01);
-
-		sendCommand(0x13);
-		WaitUntilIdle();
-		digitalWrite(_cs, LOW);
-		fSPI.beginTransaction(SPISettings(6000000, LSBFIRST, SPI_MODE0));
-		for (int x = 0; x < xmax; x++)
-		{
-			for (int row = 0; row < rowsPerColumn; row++)
-			{
-				fSPI.transfer(~buffer[x + row * xmax]);
-			}
-		}
-		fSPI.endTransaction();
-		digitalWrite(_cs, HIGH);
-
-		sendCommand(0x92); // partial out
-		WRITE_LUT_RED();
-
-		sendCommand(0xE0);
-		sendData(0x02);
-		sendCommand(0xE5);
-		sendData(0x75);
-
-		sendCommand(0x04); // Power ON
-		WaitUntilIdle();
-		sendCommand(0x12); // Display Refresh
-		WaitUntilIdle();
-		sendCommand(0x02); // Power OFF
-	}
-
 	void WRITE_LUT_RED()
 	{
 		unsigned int count;

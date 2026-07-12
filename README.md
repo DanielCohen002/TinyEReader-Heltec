@@ -31,16 +31,18 @@ Built and compile-tested without physical access to the board at first (see `har
 
 Only 2 real buttons exist: **Left** = GPIO21/USER, **Right** = GPIO0/BOOT — confirmed on real hardware.
 
-| | Left tap | Left hold | Right tap | Right hold | Both held |
-| --- | --- | --- | --- | --- | --- |
-| Reading a book | Previous page | Previous chapter | Next page | Next chapter | Home menu |
-| Home / Choose Book / Wi-Fi / delete dialog | Move selection | Open delete dialog (Choose Book only) | Move selection | Go Home / cancel (also cancels delete without deleting; no-op on Home itself) | Select / confirm (a deliberate two-button press, so it can't fire by accident) |
+| | Left tap | Left double-tap | Left hold | Right tap | Right double-tap | Right hold | Both held |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Reading a book | Previous page | Previous chapter | Keep paging back (auto-repeats) | Next page | Next chapter | Keep paging forward (auto-repeats) | Home menu |
+| Home / Choose Book / Wi-Fi / delete dialog | Move selection | — | Open delete dialog (Choose Book only) | Move selection | — | Select / confirm | Home menu (also cancels delete without deleting) |
+
+A tap only fires once a short window (250ms, `DOUBLE_TAP_WINDOW_MS`) passes without a second tap on the same button following it — that's what makes double-tap possible, at the cost of a small delay on every single page turn. Both-held is deliberately forgiving about how simultaneously the two buttons actually go down (see `BOTH_HOLD_STAGGER_GRACE_MS` in `pollButtons()`), since two physical buttons are rarely pressed within the same tens of milliseconds of each other.
 
 ## Display driver
 
 Uses Heltec's own `HT_lCMEN2R13EFC1`/`HT_E0213A367` driver classes (bundled from their Arduino library, trimmed down in `hardware-research/heltec-e213/heltec-esp32-lib-trimmed` to just the files this sketch actually needs — the full library pulls in unrelated display drivers with dependencies that aren't installed).
 
-The first render after waking/booting is a full black-flash refresh (clears ghosting); every render after that uses a fast partial refresh instead, adapted from the vendor library's own `dis_img_Partial_Refresh()` example (see `partialDisplay()` in `hardware-research/heltec-e213/heltec-esp32-lib-trimmed/src/HT_lCMEN2R13EFC1.h`) so it reads the normal `drawString`/`drawXbm` framebuffer instead of requiring a separately-supplied image array.
+Every render is a full black-flash refresh. A genuine partial/fast refresh was attempted (adapted from the vendor library's own `dis_img_Partial_Refresh()` example), including chasing down a real bug in its window parameters, but it didn't visibly help even after the fix — see git history if it's worth another look with actual hardware-debugging tools, since guessing further at undocumented LUT/waveform behavior with no way to see the panel wasn't productive.
 
 ## Storage
 
@@ -87,8 +89,8 @@ Replace `COMx` with the board's port (check Device Manager).
 ## Using it
 
 1. Flash the firmware.
-2. On the device, hold both buttons to open the Home menu, tap either button to move to **Connect to Wi-Fi**, hold both buttons to select it.
+2. On the device, hold both buttons to open the Home menu, tap either button to move to **Connect to Wi-Fi**, hold Right to select it.
 3. Scan the Wi-Fi QR code with your phone (or connect manually to `PocketReader`, password `12345678`).
 4. Open `http://192.168.4.1` (or scan the Web QR code) and upload one or more `.txt` files (or converted EPUBs — see [Chapters](#chapters-and-the-epub-converter)). Uploading doesn't open a book automatically — pick one from the device's Choose Book screen.
 5. Hold Right to back out of the Wi-Fi screen when done — Wi-Fi turns off automatically.
-6. Tap Left/Right to turn pages, hold either to jump chapters, hold both for the Home menu.
+6. Tap Left/Right to turn pages, double-tap either to jump chapters, hold either to keep paging, hold both for the Home menu.

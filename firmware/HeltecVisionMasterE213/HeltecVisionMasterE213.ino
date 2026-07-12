@@ -34,28 +34,36 @@
   confirmed on real hardware; this was backwards in the initial guess):
 
   Reading a book:
-    Left tap    -> previous page       Right tap    -> next page
-    Left hold   -> previous chapter    Right hold   -> next chapter
-    Both held   -> Home menu
+    Left tap        -> previous page      Right tap        -> next page
+    Left double-tap  -> previous chapter   Right double-tap  -> next chapter
+    Left hold        -> keep paging back   Right hold        -> keep paging forward
+                         (auto-repeats, like the CrowPanel build's Top/Bottom hold)
+    Both held        -> Home menu
 
   Everywhere else (Home / Choose Book / Wi-Fi / delete dialog):
     Left tap    -> move selection      Right tap    -> move selection
     Left hold   -> open delete dialog (Choose Book only, on a highlighted book)
-    Both held   -> select / confirm (a deliberate two-button press, so it
-                   doesn't fire by accident the way a single-button hold can)
-    Right hold  -> go Home / cancel (also cancels the delete dialog without
-                   deleting; a no-op on the Home screen itself)
+    Right hold  -> select / confirm
+    Both held   -> Home menu (also cancels the delete dialog without deleting)
 
-  Refresh strategy: the first render after waking/booting is a full
-  black-flash refresh (clears ghosting left over from before sleep); every
-  render after that uses HT_ICMEN2R13EFC1::partialDisplay() -- a fast
-  refresh adapted from the vendor library's own dis_img_Partial_Refresh()
-  example, wired up to read the normal drawString/drawXbm framebuffer
-  instead of a separately-supplied image array. See refreshDisplay() below
-  and partialDisplay()'s comment in the vendored driver file for exactly
-  what changed from the vendor's original. Unverified visually since I
-  can't see the panel -- if a partial-refreshed screen looks corrupted or
-  doesn't update some region, that's the first thing to suspect.
+  A tap only fires once its own double-tap window passes without a second
+  tap following -- see DOUBLE_TAP_WINDOW_MS -- so every single tap has a
+  small (currently 250ms) built-in delay before the page turns. Worth
+  shortening if that lag is more annoying in practice than double-tap
+  chapter-skipping is useful.
+
+  Both-held ("double push") is intentionally forgiving about how
+  simultaneously the two buttons actually go down -- see the comment on
+  bothPressStart in pollButtons() -- since two physical buttons are rarely
+  pressed within the same tens of milliseconds of each other.
+
+  Refresh strategy: every render is a full black-flash refresh. An attempt
+  at a genuine partial/fast refresh (adapted from the vendor library's own
+  dis_img_Partial_Refresh() example) didn't visibly help even after fixing
+  a real bug in its window parameters, so it was pulled back out rather
+  than keep guessing blind at undocumented LUT/waveform behavior with no
+  way to see the panel. See git history if it's worth revisiting with
+  actual hardware-debugging tools (logic analyzer, etc).
 */
 
 #include <Arduino.h>
@@ -109,24 +117,33 @@ constexpr uint32_t SLEEP_AFTER_MS = 60000;
 // capacity (RAM, not flash). The Choose Book screen only fits
 // CHOOSE_VISIBLE_ROWS at a time and scrolls to show more.
 constexpr uint8_t MAX_BOOKS = 64;
-constexpr uint8_t CHOOSE_VISIBLE_ROWS = 8;  // one row is a free-space header, see renderChooseBook()
+constexpr uint8_t CHOOSE_VISIBLE_ROWS = 6;  // one row is a free-space header, see renderChooseBook()
 
 constexpr unsigned long HOLD_THRESHOLD_MS = 500;  // tap vs. hold cutoff for both buttons
+constexpr unsigned long PAGE_REPEAT_DELAY_MS = 500;     // hold Left/Right this long to start auto-paging (reading screen only)
+constexpr unsigned long PAGE_REPEAT_INTERVAL_MS = 300;  // then advance one page this often while held
 
-// Reading screen layout. Uses ArialMT_Plain_16 (19px line height, per its
-// own font table header) for 6 lines per page, matching the CrowPanel
-// build's line count -- ArialMT_Plain_10 (13px) was fitting 9 lines, too
-// small/dense for comfortable reading.
+// Reading screen layout. Uses ArialMT_Plain_16 for readable text, but at
+// 7 lines/page rather than the font's own 19px line height (which only
+// fits 6 and leaves the screen looking sparse) -- 17px is tight enough to
+// shave 2px of inter-line clearance off the font's nominal spacing, which
+// risks clipping a descender (a 'y'/'g'/'p') on some line pairs. Worth
+// checking for on real hardware; if it looks clipped, drop back to 19/6.
 constexpr uint16_t SCREEN_W = 250;
 constexpr uint16_t SCREEN_H = 122;
 constexpr uint16_t BOOK_LEFT_MARGIN = 2;
 constexpr uint16_t BOOK_TOP_MARGIN = 1;
-constexpr uint16_t BOOK_LINE_HEIGHT = 19;
+constexpr uint16_t BOOK_LINE_HEIGHT = 17;
 constexpr uint16_t BOOK_USABLE_WIDTH = SCREEN_W - 2 * BOOK_LEFT_MARGIN;
-constexpr uint8_t BOOK_MAX_LINES = 6;  // (122-1)/19 = 6.4, rounds down to 6
+constexpr uint8_t BOOK_MAX_LINES = 7;  // (122-1)/17 = 7.1, rounds down to 7
 
+// Menu/selection screens (Home, Choose Book, delete confirm) use the same
+// font and line height as the reading screen for visual consistency --
+// the Wi-Fi screen is left at the smaller font since it's QR-code-driven,
+// not a navigable list, and the QR codes there are positioned close
+// enough to the header text that the bigger font would collide with them.
 constexpr uint16_t MENU_LEFT_MARGIN = 2;
-constexpr uint16_t MENU_LINE_HEIGHT = 13;
+constexpr uint16_t MENU_LINE_HEIGHT = BOOK_LINE_HEIGHT;
 
 WebServer server(80);
 
@@ -158,7 +175,7 @@ uint8_t homeSelection = 0;
 // same layout as the CrowPanel build's Home screen.
 constexpr uint16_t HOME_ICON_SIZE = 48;
 constexpr uint16_t HOME_ICON_Y = 30;
-constexpr uint8_t HOME_LABEL_FONT_SIZE = 10;  // smallest available (ArialMT_Plain_10)
+constexpr uint8_t HOME_LABEL_FONT_SIZE = 19;  // ArialMT_Plain_16's cell height, matching MENU_LINE_HEIGHT
 constexpr uint16_t HOME_LABEL_Y = HOME_ICON_Y + HOME_ICON_SIZE + 4;
 const uint16_t HOME_ICON_X[HOME_ITEM_COUNT] = { 26, 100, 174 };  // evenly spaced, symmetric margins
 
@@ -450,21 +467,6 @@ const char uploadPage[] PROGMEM = R"rawliteral(
 // ---------------- DISPLAY ----------------
 ScreenDisplay *display;
 bool displayNeedsReinit = true;
-// Every render used to be a full black-flash refresh (see file header).
-// Now only the first render after a wake/init uses that (to clear any
-// ghosting left over from before sleep); every other render uses
-// partialDisplay() instead. Mirrors displayNeedsReinit/epdNeedsFullInit's
-// "once per wake" pattern.
-bool displayNeedsFullRefresh = true;
-
-void refreshDisplay() {
-  if (displayNeedsFullRefresh) {
-    display->display();
-    displayNeedsFullRefresh = false;
-  } else {
-    display->partialDisplay();
-  }
-}
 
 void VextON(void) {
   pinMode(VEXT_CTRL_1, OUTPUT);
@@ -544,7 +546,6 @@ void ensureDisplayAwake() {
   delay(100);
   display->init();
   displayNeedsReinit = false;
-  displayNeedsFullRefresh = true;
 }
 
 // ---------------- UTIL ----------------
@@ -571,6 +572,19 @@ String freeSpaceLabel() {
   return String(buf);
 }
 
+// Truncates to fit maxWidth, measured against whatever font is currently
+// active -- a fixed character-count cutoff (like "26 chars") doesn't scale
+// correctly across ArialMT_Plain_10 vs _16 since it's a proportional font,
+// not the CrowPanel build's fixed-width character blitter.
+String truncateToWidth(const String& text, uint16_t maxWidth) {
+  if (display->getStringWidth(text) <= maxWidth) return text;
+  String truncated = text;
+  while (truncated.length() > 1 && display->getStringWidth(truncated + "...") > maxWidth) {
+    truncated.remove(truncated.length() - 1);
+  }
+  return truncated + "...";
+}
+
 void showMessage(const String& message) {
   ensureDisplayAwake();
   display->setFont(ArialMT_Plain_10);
@@ -588,7 +602,7 @@ void showMessage(const String& message) {
   }
 
   display->update(BLACK_BUFFER);
-  refreshDisplay();
+  display->display();
 }
 
 // ---------------- LIBRARY ----------------
@@ -1084,7 +1098,7 @@ void renderPageAt(uint32_t offset) {
     display->drawString(BOOK_LEFT_MARGIN, BOOK_TOP_MARGIN + i * BOOK_LINE_HEIGHT, lines[i]);
   }
   display->update(BLACK_BUFFER);
-  refreshDisplay();
+  display->display();
 
   savePosition();
   touchActivity();
@@ -1107,7 +1121,7 @@ void renderHome() {
   ensureDisplayAwake();
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
-  display->setFont(ArialMT_Plain_10);
+  display->setFont(ArialMT_Plain_16);  // matches the reading/menu screens' text size
 
   for (uint8_t i = 0; i < HOME_ITEM_COUNT; i++) {
     uint16_t x = HOME_ICON_X[i];
@@ -1124,12 +1138,15 @@ void renderHome() {
     }
   }
 
-  // Only Both-held does anything on this screen (selects the highlighted
-  // item); Right-held is a no-op here since Home is already Home.
-  display->drawString(4, 102, "Tap=Move  Both=Select");
+  // Only Right-hold does anything on this screen (selects the highlighted
+  // item); both-hold is a no-op here since Home is already Home. Kept at
+  // the small font -- it's a static caption, not a navigable line, and
+  // there's no vertical room left for it at the bigger size anyway.
+  display->setFont(ArialMT_Plain_10);
+  display->drawString(4, 102, "Tap=Move  Hold Right=Select");
 
   display->update(BLACK_BUFFER);
-  refreshDisplay();
+  display->display();
 }
 
 // Keeps chooseSelection inside [chooseWindowStart, chooseWindowStart +
@@ -1150,7 +1167,7 @@ void scrollChooseWindow() {
 // time.
 void renderChooseBook() {
   ensureDisplayAwake();
-  display->setFont(ArialMT_Plain_10);
+  display->setFont(ArialMT_Plain_16);
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
 
@@ -1170,26 +1187,24 @@ void renderChooseBook() {
     for (uint8_t i = chooseWindowStart; i < windowEnd; i++) {
       uint8_t row = i - chooseWindowStart;
       String label = (i == chooseSelection) ? "> " : "  ";
-      String name = bookList[i];
-      if (name.length() > 34) name = name.substring(0, 31) + "...";
-      label += name;
+      label += truncateToWidth(bookList[i], BOOK_USABLE_WIDTH - display->getStringWidth(label));
       display->drawString(MENU_LEFT_MARGIN, 2 + (row + 1) * MENU_LINE_HEIGHT, label);
     }
   }
 
   display->update(BLACK_BUFFER);
-  refreshDisplay();
+  display->display();
 }
 
 void renderConfirmDelete() {
   ensureDisplayAwake();
-  display->setFont(ArialMT_Plain_10);
+  display->setFont(ArialMT_Plain_16);
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
 
   display->drawString(MENU_LEFT_MARGIN, 2, "Delete this book?");
   String name = (chooseSelection < bookCount) ? bookList[chooseSelection] : "";
-  if (name.length() > 34) name = name.substring(0, 31) + "...";
+  name = truncateToWidth(name, BOOK_USABLE_WIDTH);
   display->drawString(MENU_LEFT_MARGIN, 2 + MENU_LINE_HEIGHT, name);
 
   String yesLabel = confirmDeleteYes ? "> Yes" : "  Yes";
@@ -1198,7 +1213,7 @@ void renderConfirmDelete() {
   display->drawString(MENU_LEFT_MARGIN, 2 + 4 * MENU_LINE_HEIGHT, noLabel);
 
   display->update(BLACK_BUFFER);
-  refreshDisplay();
+  display->display();
 }
 
 void renderWifiInfo() {
@@ -1220,7 +1235,7 @@ void renderWifiInfo() {
   display->drawString(leftX, qrY + QRWIFI_H + 4, "192.168.4.1");
 
   display->update(BLACK_BUFFER);
-  refreshDisplay();
+  display->display();
 }
 
 void enterWifiInfo() {
@@ -1271,6 +1286,10 @@ void selectHomeItem() {
 
 // ---------------- BUTTONS + SLEEP ----------------
 
+// How much of a head start the earlier-pressed button gets credited with
+// once the second one joins -- see the bothPressStart comment below.
+constexpr unsigned long BOTH_HOLD_STAGGER_GRACE_MS = 300;
+
 // Distinguishes tap/hold/both-hold from two plain buttons. "Both held"
 // takes priority the moment a second button joins in -- an individual
 // button's hold timer is ignored for as long as both are down, and only
@@ -1284,26 +1303,41 @@ ButtonGesture pollButtons() {
 
   bool nowLeft = pressed(BTN_LEFT);
   bool nowRight = pressed(BTN_RIGHT);
+  unsigned long now = millis();
 
-  if (nowLeft && !lastLeft) { leftPressStart = millis(); leftResolved = false; }
-  if (nowRight && !lastRight) { rightPressStart = millis(); rightResolved = false; }
-  if (nowLeft && nowRight && !(lastLeft && lastRight)) { bothPressStart = millis(); bothResolved = false; }
+  if (nowLeft && !lastLeft) { leftPressStart = now; leftResolved = false; }
+  if (nowRight && !lastRight) { rightPressStart = now; rightResolved = false; }
+  if (nowLeft && nowRight && !(lastLeft && lastRight)) {
+    bothResolved = false;
+    // Two physical buttons are rarely pressed within the same tens of
+    // milliseconds of each other -- crediting only the moment the second
+    // one joins would mean the user has to hold both together for the
+    // *entire* HOLD_THRESHOLD_MS, on top of however long they'd already
+    // been juggling getting both fingers down. Backdating the start time
+    // to the earlier button's own press (capped at BOTH_HOLD_STAGGER_GRACE_MS
+    // of credit) forgives a staggered press without making a brief
+    // incidental overlap during an unrelated long single-button hold
+    // (e.g. while auto-repeating pages) instantly count as a chord.
+    unsigned long earlier = min(leftPressStart, rightPressStart);
+    unsigned long earliestCreditable = now - BOTH_HOLD_STAGGER_GRACE_MS;
+    bothPressStart = (earlier > earliestCreditable) ? earlier : earliestCreditable;
+  }
 
   ButtonGesture gesture = GESTURE_NONE;
 
   if (nowLeft && nowRight) {
-    if (!bothResolved && millis() - bothPressStart >= HOLD_THRESHOLD_MS) {
+    if (!bothResolved && now - bothPressStart >= HOLD_THRESHOLD_MS) {
       gesture = GESTURE_BOTH_HOLD;
       bothResolved = true;
       leftResolved = true;
       rightResolved = true;
     }
   } else {
-    if (nowLeft && !leftResolved && millis() - leftPressStart >= HOLD_THRESHOLD_MS) {
+    if (nowLeft && !leftResolved && now - leftPressStart >= HOLD_THRESHOLD_MS) {
       gesture = GESTURE_LEFT_HOLD;
       leftResolved = true;
     }
-    if (nowRight && !rightResolved && millis() - rightPressStart >= HOLD_THRESHOLD_MS) {
+    if (nowRight && !rightResolved && now - rightPressStart >= HOLD_THRESHOLD_MS) {
       gesture = GESTURE_RIGHT_HOLD;
       rightResolved = true;
     }
@@ -1317,24 +1351,11 @@ ButtonGesture pollButtons() {
   return gesture;
 }
 
+// Handles every screen except SCREEN_READING, which has its own gesture
+// vocabulary (double-tap, hold-to-repeat) driven by handleReadingButtons()
+// below instead of this plain tap/hold/both-hold dispatch.
 void dispatchGesture(ButtonGesture gesture) {
   switch (currentScreen) {
-    case SCREEN_READING:
-      switch (gesture) {
-        case GESTURE_LEFT_TAP: previousPage(); break;
-        case GESTURE_LEFT_HOLD: previousChapter(); break;
-        case GESTURE_RIGHT_TAP: nextPage(); break;
-        case GESTURE_RIGHT_HOLD: nextChapter(); break;
-        case GESTURE_BOTH_HOLD: enterHome(); break;
-        default: break;
-      }
-      break;
-
-    // Everywhere outside the reading screen, select/confirm is Both-held
-    // (deliberate two-button press) and Right-held is the universal
-    // go-home/cancel gesture -- previously Right-held did the selecting,
-    // which meant an accidental Right hold (e.g. while just meaning to
-    // page/chapter-skip out of habit) could fire a selection by mistake.
     case SCREEN_HOME:
       switch (gesture) {
         case GESTURE_LEFT_TAP:
@@ -1345,8 +1366,9 @@ void dispatchGesture(ButtonGesture gesture) {
           homeSelection = (homeSelection + 1) % HOME_ITEM_COUNT;
           renderHome();
           break;
-        case GESTURE_BOTH_HOLD: selectHomeItem(); break;
-        default: break;  // Right-held (go home) is a no-op here -- already Home
+        case GESTURE_RIGHT_HOLD: selectHomeItem(); break;
+        case GESTURE_BOTH_HOLD: enterHome(); break;
+        default: break;
       }
       break;
 
@@ -1363,17 +1385,16 @@ void dispatchGesture(ButtonGesture gesture) {
             scrollChooseWindow();
             renderChooseBook();
             break;
-          case GESTURE_BOTH_HOLD: openBook(bookList[chooseSelection]); break;
+          case GESTURE_RIGHT_HOLD: openBook(bookList[chooseSelection]); break;
           case GESTURE_LEFT_HOLD: enterConfirmDelete(); break;
           default: break;
         }
       }
-      if (gesture == GESTURE_RIGHT_HOLD) enterHome();
+      if (gesture == GESTURE_BOTH_HOLD) enterHome();
       break;
 
     case SCREEN_WIFI_INFO:
-      // Nothing to select on this screen -- Right-held just backs out.
-      if (gesture == GESTURE_RIGHT_HOLD) {
+      if (gesture == GESTURE_RIGHT_HOLD || gesture == GESTURE_BOTH_HOLD) {
         exitWifiInfo();
         enterHome();
       }
@@ -1386,7 +1407,7 @@ void dispatchGesture(ButtonGesture gesture) {
           confirmDeleteYes = !confirmDeleteYes;
           renderConfirmDelete();
           break;
-        case GESTURE_BOTH_HOLD:
+        case GESTURE_RIGHT_HOLD:
           currentScreen = SCREEN_CHOOSE_BOOK;
           if (confirmDeleteYes) {
             deleteSelectedBook();  // re-renders Choose Book itself
@@ -1394,17 +1415,109 @@ void dispatchGesture(ButtonGesture gesture) {
             renderChooseBook();
           }
           break;
-        case GESTURE_RIGHT_HOLD:
-          enterHome();  // cancels without deleting
+        case GESTURE_BOTH_HOLD:
+          enterHome();
           break;
         default: break;
       }
       break;
+
+    default: break;  // SCREEN_READING is handled separately
+  }
+}
+
+constexpr unsigned long DOUBLE_TAP_WINDOW_MS = 250;  // see file header for the latency tradeoff this implies
+
+// Reading screen only: a tap only fires (page turn) once DOUBLE_TAP_WINDOW_MS
+// passes without a second tap on the same button following it, in which
+// case that pair fires a chapter skip instead. Left/Right-hold from
+// pollButtons() are ignored here (their single-fire nature doesn't suit
+// "keep paging while held") in favor of directly polling the raw pin state
+// below for continuous auto-repeat, the same way the CrowPanel build's
+// Top/Bottom hold-to-repeat works.
+void handleReadingButtons(ButtonGesture gesture) {
+  static bool leftTapPending = false, rightTapPending = false;
+  static unsigned long leftTapTime = 0, rightTapTime = 0;
+  unsigned long now = millis();
+
+  if (leftTapPending && now - leftTapTime >= DOUBLE_TAP_WINDOW_MS) {
+    leftTapPending = false;
+    previousPage();
+  }
+  if (rightTapPending && now - rightTapTime >= DOUBLE_TAP_WINDOW_MS) {
+    rightTapPending = false;
+    nextPage();
+  }
+
+  static unsigned long leftHoldStart = 0, leftLastRepeat = 0;
+  static unsigned long rightHoldStart = 0, rightLastRepeat = 0;
+  static bool wasLeftDown = false, wasRightDown = false;
+  bool nowLeftDown = pressed(BTN_LEFT);
+  bool nowRightDown = pressed(BTN_RIGHT);
+
+  if (nowLeftDown && !wasLeftDown) { leftHoldStart = now; leftLastRepeat = now; }
+  if (nowRightDown && !wasRightDown) { rightHoldStart = now; rightLastRepeat = now; }
+
+  // Suppressed while both are down so a both-held-for-Home attempt doesn't
+  // also spray page turns while the user is getting both fingers on.
+  if (!(nowLeftDown && nowRightDown)) {
+    if (nowLeftDown && now - leftHoldStart >= PAGE_REPEAT_DELAY_MS &&
+        now - leftLastRepeat >= PAGE_REPEAT_INTERVAL_MS) {
+      leftLastRepeat = now;
+      touchActivity();
+      previousPage();
+    }
+    if (nowRightDown && now - rightHoldStart >= PAGE_REPEAT_DELAY_MS &&
+        now - rightLastRepeat >= PAGE_REPEAT_INTERVAL_MS) {
+      rightLastRepeat = now;
+      touchActivity();
+      nextPage();
+    }
+  }
+
+  wasLeftDown = nowLeftDown;
+  wasRightDown = nowRightDown;
+
+  switch (gesture) {
+    case GESTURE_LEFT_TAP:
+      if (leftTapPending) {
+        leftTapPending = false;
+        touchActivity();
+        previousChapter();
+      } else {
+        leftTapPending = true;
+        leftTapTime = now;
+      }
+      break;
+    case GESTURE_RIGHT_TAP:
+      if (rightTapPending) {
+        rightTapPending = false;
+        touchActivity();
+        nextChapter();
+      } else {
+        rightTapPending = true;
+        rightTapTime = now;
+      }
+      break;
+    case GESTURE_BOTH_HOLD:
+      touchActivity();
+      enterHome();
+      break;
+    default: break;  // LEFT_HOLD/RIGHT_HOLD: repeat is handled above instead
   }
 }
 
 void handleButtons() {
   ButtonGesture gesture = pollButtons();
+
+  // The reading screen needs to run its repeat/double-tap timing checks
+  // every tick, not just when a new gesture fires, so it's dispatched
+  // unconditionally instead of gated behind gesture != GESTURE_NONE below.
+  if (currentScreen == SCREEN_READING) {
+    handleReadingButtons(gesture);
+    return;
+  }
+
   if (gesture == GESTURE_NONE) return;
   touchActivity();
   dispatchGesture(gesture);
